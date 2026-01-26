@@ -24,13 +24,19 @@ def launch_streamlit() -> None:
         "--server.port=8501",
         "--browser.gatherUsageStats=false",
     ]
-    p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(1.0)
+    env = os.environ.copy()
+    env["TNPI_STREAMLIT_CHILD"] = "1"
+    p = subprocess.Popen(
+        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env
+    )
+    time.sleep(0.1)
     webbrowser.open("http://localhost:8501")
     p.wait()
 
 
 def running_in_streamlit() -> bool:
+    if os.environ.get("TNPI_STREAMLIT_CHILD") == "1":
+        return True
     try:
         from streamlit.runtime.scriptrunner import get_script_run_ctx
     except Exception:
@@ -43,3 +49,6 @@ if __name__ == "__main__":
         run()
     else:
         launch_streamlit()
+
+
+# pyinstaller app.py --onefile --copy-metadata streamlit --collect-all streamlit

@@ -1,4 +1,4 @@
-import streamlit as st
+﻿import streamlit as st
 
 from state import AppConfig, CompareConfig
 
@@ -7,32 +7,31 @@ def render_sidebar(app_cfg: AppConfig) -> CompareConfig:
     with st.sidebar:
         st.header("Scoring settings")
         st.caption("Hover the info icons for formulas and details.")
-        current = app_cfg.compare
         prev = (
-            current.accuracy_denominator,
-            current.out_of_range_policy,
-            current.aggregate_policy,
+            app_cfg.compare.accuracy_denominator,
+            app_cfg.compare.out_of_range_policy,
+            app_cfg.compare.aggregate_policy,
         )
         accuracy_denominator = st.radio(
             "Accuracy normalization",
-            help="range: d = max(high) - min(high); std: d = std(high); abs_truth: r = |y_low - y_hat| / (|truth| + eps), point_acc = 1 - clip(r, 0, 1).",
+            help="range: d = max(odg) - min(odg); std: d = std(odg); abs_truth: r = |y_plant - y_hat| / (|truth| + eps), point_acc = 1 - clip(r, 0, 1).",
             options=["range", "std", "abs_truth"],
             format_func=lambda x: {
-                "range": "range = max(high) - min(high)",
-                "std": "std = std(high)",
+                "range": "range = max(odg) - min(odg)",
+                "std": "std = std(odg)",
                 "abs_truth": "abs_truth = |truth(t)| (relative error)",
             }[x],
-            index=["range", "std", "abs_truth"].index(current.accuracy_denominator),
+            index=["range", "std", "abs_truth"].index(app_cfg.compare.accuracy_denominator),
         )
         out_of_range_policy = st.radio(
-            "If low timestamps are outside high range",
-            help="drop: x_hat = NaN for out-of-range points; clip: t_low2 = clip(t_low, t_high[0], t_high[-1]) then interpolate.",
+            "If plant timestamps are outside odg range",
+            help="drop: x_hat = NaN for out-of-range points; clip: t_plant2 = clip(t_plant, t_odg[0], t_odg[-1]) then interpolate.",
             options=["drop", "clip"],
             format_func=lambda x: {
                 "drop": "drop those points (not scored)",
                 "clip": "clip to boundary values",
             }[x],
-            index=["drop", "clip"].index(current.out_of_range_policy),
+            index=["drop", "clip"].index(app_cfg.compare.out_of_range_policy),
         )
         aggregate_policy = st.radio(
             "Aggregate per-signal accuracy",
@@ -42,10 +41,10 @@ def render_sidebar(app_cfg: AppConfig) -> CompareConfig:
                 "mean": "mean",
                 "min": "min (conservative)",
             }[x],
-            index=["mean", "min"].index(current.aggregate_policy),
+            index=["mean", "min"].index(app_cfg.compare.aggregate_policy),
         )
     app_cfg.compare = CompareConfig(
-        time_col=current.time_col,
+        time_col=app_cfg.compare.time_col,
         accuracy_denominator=accuracy_denominator,
         out_of_range_policy=out_of_range_policy,
         aggregate_policy=aggregate_policy,

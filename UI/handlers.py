@@ -1,166 +1,122 @@
+﻿import os
 from typing import Callable, Optional, Tuple
 
 import pandas as pd
 
-import numpy as np
-
-from multiprocess import compute_accuracy_for_all_high_mp
-from state import AppConfig, CompareConfig, RunResult
-from utils import (
-    compute_compare_metrics,
-    compute_high_meta,
-    compute_low_time_range_and_signal_count,
-    compute_signal_match_stats_all,
-    load_high_folder_from_dir,
-    load_low_folder_from_dir,
+from core.parallel import compute_accuracy_for_all_odg_mp
+from state import AppConfig, RunResult
+from core.io_csv import detect_csv_encoding
+from core.parse import (
+    compute_odg_meta,
+    compute_plant_time_range_and_signal_count,
+    load_odg_folder_from_dir,
+    load_plant_folder_from_dir,
 )
-
-
-def reset_high_state(
-    app_cfg: AppConfig,
-) -> None:
-    ui_state = app_cfg.state
-    high_cfg = app_cfg.high
-    ui_state.high_confirmed = False
-    high_cfg.high_files = None
-    high_cfg.high_names = []
-    high_cfg.high_time_range = None
-    high_cfg.high_signal_count = None
-    high_cfg.high_row_count = None
-
-
-def reset_low_state(
-    app_cfg: AppConfig,
-) -> None:
-    ui_state = app_cfg.state
-    low_cfg = app_cfg.low
-    ui_state.low_confirmed = False
-    low_cfg.low_time_range = None
-    low_cfg.low_signal_count = None
-    low_cfg.low_map_bytes = None
-    low_cfg.low_data_bytes = None
-    low_cfg.low_map_count = None
-    low_cfg.low_data_count = None
-    low_cfg.low_data_rows = None
-
-
-def confirm_high_folder(app_cfg: AppConfig, folder_path: str) -> Optional[str]:
-    ui_state = app_cfg.state
-    high_cfg = app_cfg.high
-    if not folder_path:
-        return "Please enter a folder path before confirming."
-    try:
-        ui_state.high_folder = folder_path
-        high_cfg.high_files = load_high_folder_from_dir(folder_path)
-        high_cfg.high_names = sorted(high_cfg.high_files.keys())
-        (
-            high_cfg.high_time_range,
-            high_cfg.high_signal_count,
-            high_cfg.high_row_count,
-        ) = compute_high_meta(high_cfg.high_files)
-        if high_cfg.high_time_range is not None:
-            t_min, t_max = high_cfg.high_time_range
-            dt_min = pd.to_datetime(int(t_min), unit="ns")
-            dt_max = pd.to_datetime(int(t_max), unit="ns")
-            ui_state.range_start = dt_min.strftime("%Y-%m-%d-%H-%M")
-            ui_state.range_end = dt_max.strftime("%Y-%m-%d-%H-%M")
-        ui_state.high_confirmed = True
-    except Exception as ex:
-        reset_high_state(app_cfg)
-        return f"ODG confirm failed: {ex}"
-    return None
-
-
-def confirm_low_folder(app_cfg: AppConfig, folder_path: str) -> Optional[str]:
-    ui_state = app_cfg.state
-    low_cfg = app_cfg.low
-    if not folder_path:
-        return "Please enter a folder path before confirming."
-    try:
-        ui_state.low_folder = folder_path
-        (
-            low_cfg.low_map_bytes,
-            low_cfg.low_data_bytes,
-            low_cfg.low_map_count,
-            low_cfg.low_data_count,
-            low_cfg.low_data_rows,
-        ) = load_low_folder_from_dir(folder_path)
-        low_cfg.low_time_range, low_cfg.low_signal_count = (
-            compute_low_time_range_and_signal_count(
-                low_cfg.low_map_bytes,
-                low_cfg.low_data_bytes,
-            )
-        )
-        ui_state.low_confirmed = True
-    except Exception as ex:
-        reset_low_state(app_cfg)
-        return f"PlantDB confirm failed: {ex}"
-    return None
 
 
 def confirm_samples(
     app_cfg: AppConfig,
-    high_folder: str,
-    low_folder: str,
+    odg_folder: str,
+    plant_folder: str,
 ) -> Optional[str]:
-    high_path = (high_folder or "").strip()
-    low_path = (low_folder or "").strip()
-    if not high_path or not low_path:
-        return "Please enter both high and low folder paths before confirming."
-    high_error = confirm_high_folder(app_cfg, high_path)
-    if high_error:
-        return high_error
-    low_error = confirm_low_folder(app_cfg, low_path)
-    if low_error:
-        reset_high_state(app_cfg)
-        return low_error
+    odg_path = (odg_folder or "").strip()
+    plant_path = (plant_folder or "").strip()
+    if not odg_path or not plant_path:
+        return "Please enter both odg and plant folder paths before confirming."
+    odg_error = confirm_odg_folder(app_cfg, odg_path)
+    if odg_error:
+        return odg_error
+    plant_error = confirm_plant_folder(app_cfg, plant_path)
+    if plant_error:
+        reset_odg_state(app_cfg)
+        return plant_error
     overlap_error = validate_sampling_overlap(app_cfg)
     if overlap_error:
-        reset_high_state(app_cfg)
-        reset_low_state(app_cfg)
+        reset_odg_state(app_cfg)
+        reset_plant_state(app_cfg)
         return overlap_error
     app_cfg.dump_ini()
     return None
 
 
-def validate_sampling_overlap(app_cfg: AppConfig) -> Optional[str]:
-    high_cfg = app_cfg.high
-    low_cfg = app_cfg.low
-    if high_cfg.high_time_range is None or low_cfg.low_time_range is None:
-        return "Unable to read sampling time ranges for overlap check."
-    high_start, high_end = high_cfg.high_time_range
-    low_start, low_end = low_cfg.low_time_range
-    overlap_start = max(high_start, low_start)
-    overlap_end = min(high_end, low_end)
-    if overlap_start > overlap_end:
-        return "ODG and PlantDB time ranges do not overlap."
+def confirm_odg_folder(app_cfg: AppConfig, folder_path: str) -> Optional[str]:
+    if not folder_path:
+        return "Please enter a folder path before confirming."
+    try:
+        app_cfg.state.odg_folder = folder_path
+        app_cfg.odg.odg_files = load_odg_folder_from_dir(folder_path)
+        encodings = {detect_csv_encoding(p) for p in app_cfg.odg.odg_files}
+        if len(encodings) > 1:
+            raise ValueError(f"ODG CSV encodings are inconsistent: {sorted(encodings)}")
+        app_cfg.odg.odg_encoding = next(iter(encodings)) if encodings else None
+        app_cfg.odg.odg_names = [os.path.basename(p) for p in app_cfg.odg.odg_files]
+        (
+            app_cfg.odg.odg_time_range,
+            app_cfg.odg.odg_signal_count,
+            app_cfg.odg.odg_row_count,
+        ) = compute_odg_meta(app_cfg.odg.odg_files, encoding=app_cfg.odg.odg_encoding)
+        if app_cfg.odg.odg_time_range is not None:
+            t_min, t_max = app_cfg.odg.odg_time_range
+            dt_min = pd.to_datetime(int(t_min), unit="ns")
+            dt_max = pd.to_datetime(int(t_max), unit="ns")
+            app_cfg.state.range_start = dt_min.strftime("%Y-%m-%d-%H-%M")
+            app_cfg.state.range_end = dt_max.strftime("%Y-%m-%d-%H-%M")
+        app_cfg.state.odg_confirmed = True
+    except Exception as ex:
+        reset_odg_state(app_cfg)
+        return f"ODG confirm failed: {ex}"
     return None
 
 
-def parse_time_range(
-    range_mode: str,
-    range_start: str,
-    range_end: str,
-) -> Tuple[Optional[Tuple[float, float]], Optional[str]]:
-    if range_mode != "range":
-        return None, None
-    start_txt = (range_start or "").strip()
-    end_txt = (range_end or "").strip()
-    if not start_txt or not end_txt:
-        return None, "Please enter both range start and range end."
+def confirm_plant_folder(app_cfg: AppConfig, folder_path: str) -> Optional[str]:
+    if not folder_path:
+        return "Please enter a folder path before confirming."
     try:
-        start_dt = pd.to_datetime(start_txt, format="%Y-%m-%d-%H-%M", errors="coerce")
-        end_dt = pd.to_datetime(end_txt, format="%Y-%m-%d-%H-%M", errors="coerce")
-        if pd.isna(start_dt) or pd.isna(end_dt):
-            raise ValueError
-        start_val = float(start_dt.value)
-        end_val = float(end_dt.value)
-    except ValueError:
-        return (
-            None,
-            "Range values must use format YYYY-mm-dd-hh-mm (e.g., 2024-01-01-00-00).",
+        app_cfg.state.plant_folder = folder_path
+        (
+            app_cfg.plant.plant_map_files,
+            app_cfg.plant.plant_data_files,
+            app_cfg.plant.plant_map_count,
+            app_cfg.plant.plant_data_count,
+            app_cfg.plant.plant_data_rows,
+        ) = load_plant_folder_from_dir(folder_path)
+        map_encodings = {detect_csv_encoding(p) for p in app_cfg.plant.plant_map_files}
+        if len(map_encodings) > 1:
+            raise ValueError(f"Plant map CSV encodings are inconsistent: {sorted(map_encodings)}")
+        app_cfg.plant.plant_map_encoding = next(iter(map_encodings)) if map_encodings else None
+        data_encodings = {detect_csv_encoding(p) for p in app_cfg.plant.plant_data_files}
+        if len(data_encodings) > 1:
+            raise ValueError(f"Plant data CSV encodings are inconsistent: {sorted(data_encodings)}")
+        app_cfg.plant.plant_data_encoding = next(iter(data_encodings)) if data_encodings else None
+        (
+            app_cfg.plant.plant_time_range,
+            app_cfg.plant.plant_signal_count,
+            app_cfg.plant.plant_id_signal_map,
+        ) = (
+            compute_plant_time_range_and_signal_count(
+                app_cfg.plant.plant_map_files,
+                app_cfg.plant.plant_data_files,
+                map_encoding=app_cfg.plant.plant_map_encoding,
+                data_encoding=app_cfg.plant.plant_data_encoding,
+            )
         )
-    return (start_val, end_val), None
+        app_cfg.state.plant_confirmed = True
+    except Exception as ex:
+        reset_plant_state(app_cfg)
+        return f"PlantDB confirm failed: {ex}"
+    return None
+
+
+def validate_sampling_overlap(app_cfg: AppConfig) -> Optional[str]:
+    if app_cfg.odg.odg_time_range is None or app_cfg.plant.plant_time_range is None:
+        return "Unable to read sampling time ranges for overlap check."
+    odg_start, odg_end = app_cfg.odg.odg_time_range
+    plant_start, plant_end = app_cfg.plant.plant_time_range
+    overlap_start = max(odg_start, plant_start)
+    overlap_end = min(odg_end, plant_end)
+    if overlap_start > overlap_end:
+        return "ODG and PlantDB time ranges do not overlap."
+    return None
 
 
 def compute_run_result(
@@ -169,84 +125,23 @@ def compute_run_result(
     range_mode: str,
     range_start: str,
     range_end: str,
-    run_mode: str,
-    progress_cb: Callable[[int, int], None],
+    progress_cb: Callable,
 ) -> RunResult:
-    high_cfg = app_cfg.high
-    low_cfg = app_cfg.low
-    cfg = app_cfg.compare
-    time_range, range_error = parse_time_range(range_mode, range_start, range_end)
-    if range_error:
-        return RunResult(ok=False, error=range_error)
-    low_map_bytes = low_cfg.low_map_bytes
-    low_data_bytes = low_cfg.low_data_bytes
-    detail_all = pd.DataFrame()
-    if run_mode == "multiprocess":
-        metrics, detail_all = compute_accuracy_for_all_high_mp(
-            low_map_bytes,
-            low_data_bytes,
-            high_cfg.high_files,
-            cfg,
-            progress_cb=progress_cb,
-            time_range=time_range,
-        )
-    else:
-        high_names = high_cfg.high_names
-        metrics_rows = []
-        detail_rows = []
-        for idx, name in enumerate(high_names, start=1):
-            try:
-                metrics, detail = compute_compare_metrics(
-                    low_map_bytes,
-                    low_data_bytes,
-                    high_cfg.high_files[name],
-                    cfg,
-                    time_range,
-                )
-                metrics_rows.append(metrics)
-                if not detail.empty:
-                    detail_rows.append(detail)
-            except Exception:
-                metrics_rows.append(
-                    {
-                        "matching_score": float("nan"),
-                        "rmse": float("nan"),
-                        "correlation": float("nan"),
-                        "offset_ms": float("nan"),
-                    }
-                )
-            progress_cb(idx, len(high_names))
-        if metrics_rows:
-            metrics = {
-                "matching_score": float(np.nanmean([m["matching_score"] for m in metrics_rows])),
-                "rmse": float(np.nanmean([m["rmse"] for m in metrics_rows])),
-                "correlation": float(np.nanmean([m["correlation"] for m in metrics_rows])),
-                "offset_ms": float(np.nanmean([m["offset_ms"] for m in metrics_rows])),
-            }
-        else:
-            metrics = {
-                "matching_score": float("nan"),
-                "rmse": float("nan"),
-                "correlation": float("nan"),
-                "offset_ms": float("nan"),
-            }
-        if detail_rows:
-            detail_all = pd.concat(detail_rows, ignore_index=True)
     try:
-        match_stats = compute_signal_match_stats_all(
-            low_map_bytes,
-            low_data_bytes,
-            high_cfg.high_files,
-        )
-    except Exception as ex:
-        match_stats = {
-            "low_signals": 0,
-            "high_signals": 0,
-            "overlap": 0,
-            "missing_in_high": 0,
-            "missing_in_low": 0,
-            "error": str(ex),
-        }
+        time_range = parse_time_range(range_mode, range_start, range_end)
+    except ValueError as ex:
+        return RunResult(ok=False, error=str(ex))
+
+    metrics, detail_all = compute_accuracy_for_all_odg_mp(
+        app_cfg.plant.plant_id_signal_map,
+        app_cfg.plant.plant_data_files,
+        app_cfg.odg.odg_files,
+        app_cfg.compare,
+        progress_cb=progress_cb,
+        time_range=time_range,
+        plant_data_encoding=app_cfg.plant.plant_data_encoding,
+        odg_encoding=app_cfg.odg.odg_encoding,
+    )
     return RunResult(
         ok=True,
         summary=metrics["matching_score"],
@@ -254,6 +149,62 @@ def compute_run_result(
         rmse=metrics["rmse"],
         correlation=metrics["correlation"],
         offset_ms=metrics["offset_ms"],
-        match_stats=match_stats,
         detail=detail_all,
     )
+
+
+def parse_time_range(
+    range_mode: str,
+    range_start: str,
+    range_end: str,
+) -> Optional[Tuple[float, float]]:
+    if range_mode != "range":
+        return None
+    start_txt = (range_start or "").strip()
+    end_txt = (range_end or "").strip()
+    if not start_txt or not end_txt:
+        raise ValueError("Please enter both range start and range end.")
+    try:
+        start_dt = pd.to_datetime(start_txt, format="%Y-%m-%d-%H-%M", errors="coerce")
+        end_dt = pd.to_datetime(end_txt, format="%Y-%m-%d-%H-%M", errors="coerce")
+        if pd.isna(start_dt) or pd.isna(end_dt):
+            raise ValueError
+        start_val = float(start_dt.value)
+        end_val = float(end_dt.value)
+    except ValueError:
+        raise ValueError(
+            "Range values must use format YYYY-mm-dd-hh-mm (e.g., 2026-01-21-13-45)."
+        )
+    return start_val, end_val
+
+
+def reset_odg_state(
+    app_cfg: AppConfig,
+) -> None:
+    ui_state = app_cfg.state
+    odg_cfg = app_cfg.odg
+    ui_state.odg_confirmed = False
+    odg_cfg.odg_files = []
+    odg_cfg.odg_names = []
+    odg_cfg.odg_time_range = None
+    odg_cfg.odg_signal_count = None
+    odg_cfg.odg_row_count = None
+    odg_cfg.odg_encoding = None
+
+
+def reset_plant_state(
+    app_cfg: AppConfig,
+) -> None:
+    ui_state = app_cfg.state
+    plant_cfg = app_cfg.plant
+    ui_state.plant_confirmed = False
+    plant_cfg.plant_time_range = None
+    plant_cfg.plant_signal_count = None
+    plant_cfg.plant_id_signal_map = {}
+    plant_cfg.plant_map_files = []
+    plant_cfg.plant_data_files = []
+    plant_cfg.plant_map_count = None
+    plant_cfg.plant_data_count = None
+    plant_cfg.plant_data_rows = None
+    plant_cfg.plant_map_encoding = None
+    plant_cfg.plant_data_encoding = None

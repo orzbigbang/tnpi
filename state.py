@@ -1,18 +1,10 @@
-from dataclasses import dataclass, field
+﻿from dataclasses import dataclass, field
 import configparser
 import os
-from typing import Any, Dict, List, Optional, Tuple, Literal, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple, Literal
 
-if TYPE_CHECKING:
-    import pandas as pd
-
-
-@dataclass
-class CompareConfig:
-    time_col: str
-    accuracy_denominator: Literal["range", "std", "abs_truth"]
-    out_of_range_policy: Literal["drop", "clip"]
-    aggregate_policy: Literal["mean", "min"]
+import pandas as pd
+from enum_types import SignalType
 
 
 @dataclass
@@ -23,7 +15,6 @@ class RunResult:
     rmse: Optional[float] = None
     correlation: Optional[float] = None
     offset_ms: Optional[float] = None
-    match_stats: Optional[dict] = None
     error: Optional[str] = None
     detail: Optional["pd.DataFrame"] = None
 
@@ -56,52 +47,57 @@ class MetadataConfig:
 
 @dataclass
 class StateConfig:
-    run_mode: str = "multiprocess"
+    is_confirming: bool = False
     is_running: bool = False
     range_start: str = ""
     range_end: str = ""
     range_mode: str = "full"
-    high_folder: str = ""
-    low_folder: str = ""
-    high_confirmed: bool = False
-    low_confirmed: bool = False
+    odg_folder: str = ""
+    plant_folder: str = ""
+    odg_confirmed: bool = False
+    plant_confirmed: bool = False
     last_result: Optional["RunResult"] = None
 
 
 @dataclass
-class HighConfig:
-    high_files: Optional[Dict[str, bytes]] = None
-    high_names: List[str] = field(default_factory=list)
-    high_time_range: Optional[Tuple[float, float]] = None
-    high_signal_count: Optional[int] = None
-    high_row_count: Optional[int] = None
+class OdgConfig:
+    odg_files: List[str] = field(default_factory=list)
+    odg_names: List[str] = field(default_factory=list)
+    odg_time_range: Optional[Tuple[float, float]] = None
+    odg_signal_count: Optional[int] = None
+    odg_row_count: Optional[int] = None
+    odg_encoding: Optional[str] = None
 
 
 @dataclass
-class LowConfig:
-    low_time_range: Optional[Tuple[float, float]] = None
-    low_signal_count: Optional[int] = None
-    low_map_bytes: Optional[bytes] = None
-    low_data_bytes: Optional[bytes] = None
-    low_map_count: Optional[int] = None
-    low_data_count: Optional[int] = None
-    low_data_rows: Optional[int] = None
+class PlantConfig:
+    plant_time_range: Optional[Tuple[float, float]] = None
+    plant_signal_count: Optional[int] = None
+    plant_map_files: List[str] = field(default_factory=list)
+    plant_data_files: List[str] = field(default_factory=list)
+    plant_id_signal_map: Dict[str, Tuple[str, "SignalType"]] = field(default_factory=dict)
+    plant_map_count: Optional[int] = None
+    plant_data_count: Optional[int] = None
+    plant_data_rows: Optional[int] = None
+    plant_map_encoding: Optional[str] = None
+    plant_data_encoding: Optional[str] = None
+
+
+@dataclass
+class CompareConfig:
+    time_col: str = "auto"
+    accuracy_denominator: Literal["range", "std", "abs_truth"] = "range"
+    out_of_range_policy: Literal["drop", "clip"] = "drop"
+    aggregate_policy: Literal["mean", "min"] = "mean"
 
 
 @dataclass
 class AppConfig:
     metadata: MetadataConfig = field(default_factory=MetadataConfig)
     state: StateConfig = field(default_factory=StateConfig)
-    high: HighConfig = field(default_factory=HighConfig)
-    low: LowConfig = field(default_factory=LowConfig)
-    compare: CompareConfig = field(
-        default_factory=lambda: CompareConfig(
-            time_col="auto",
-            accuracy_denominator="range",
-            out_of_range_policy="drop",
-            aggregate_policy="mean",
-        )
-    )
+    odg: OdgConfig = field(default_factory=OdgConfig)
+    plant: PlantConfig = field(default_factory=PlantConfig)
+    compare: CompareConfig = field(default_factory=CompareConfig)
 
     @staticmethod
     def _default_ini_path() -> str:
@@ -113,10 +109,16 @@ class AppConfig:
         os.makedirs(os.path.dirname(ini_path), exist_ok=True)
         parser = configparser.ConfigParser()
         parser["state"] = {
-            "run_mode": self.state.run_mode,
             "range_mode": self.state.range_mode,
-            "high_folder": self.state.high_folder,
-            "low_folder": self.state.low_folder,
+            "odg_folder": self.state.odg_folder,
+            "plant_folder": self.state.plant_folder,
+        }
+        parser["odg"] = {
+            "encoding": self.odg.odg_encoding or "",
+        }
+        parser["plant"] = {
+            "map_encoding": self.plant.plant_map_encoding or "",
+            "data_encoding": self.plant.plant_data_encoding or "",
         }
         parser["compare"] = {
             "accuracy_denominator": self.compare.accuracy_denominator,
@@ -136,10 +138,17 @@ class AppConfig:
         parser.read(ini_path, encoding="utf-8")
         config = cls()
         if parser.has_section("state"):
-            config.state.run_mode = parser.get("state", "run_mode", fallback=config.state.run_mode)
             config.state.range_mode = parser.get("state", "range_mode", fallback=config.state.range_mode)
-            config.state.high_folder = parser.get("state", "high_folder", fallback=config.state.high_folder)
-            config.state.low_folder = parser.get("state", "low_folder", fallback=config.state.low_folder)
+            config.state.odg_folder = parser.get(
+                "state",
+                "odg_folder",
+                fallback=parser.get("state", "high_folder", fallback=config.state.odg_folder),
+            )
+            config.state.plant_folder = parser.get(
+                "state",
+                "plant_folder",
+                fallback=parser.get("state", "low_folder", fallback=config.state.plant_folder),
+            )
         if parser.has_section("compare"):
             config.compare.accuracy_denominator = parser.get(
                 "compare", "accuracy_denominator", fallback=config.compare.accuracy_denominator
@@ -150,6 +159,14 @@ class AppConfig:
             config.compare.aggregate_policy = parser.get(
                 "compare", "aggregate_policy", fallback=config.compare.aggregate_policy
             )
+        if parser.has_section("odg"):
+            enc = parser.get("odg", "encoding", fallback="").strip()
+            config.odg.odg_encoding = enc or None
+        if parser.has_section("plant"):
+            map_enc = parser.get("plant", "map_encoding", fallback="").strip()
+            data_enc = parser.get("plant", "data_encoding", fallback="").strip()
+            config.plant.plant_map_encoding = map_enc or None
+            config.plant.plant_data_encoding = data_enc or None
         return config
 
 

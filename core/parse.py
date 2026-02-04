@@ -271,7 +271,8 @@ def compute_plant_time_range_and_signal_count(
             try:
                 st = SignalType(st_str)
             except Exception as ex:
-                raise ValueError(f"Invalid signal type '{st_raw}' in {path}.") from ex
+                st = SignalType.LOW
+                # raise ValueError(f"Invalid signal type '{st_raw}' in {path}.") from ex
             val = (name, st)
             if key in merged_mapping and merged_mapping[key] != val:
                 raise ValueError(

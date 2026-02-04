@@ -20,13 +20,29 @@ DATE_TIME_COL_CANDIDATES = {
 
 
 def parse_time_values(series: pd.Series) -> pd.Series:
-    t_num = pd.to_numeric(series, errors="coerce")
-    if t_num.notna().all():
-        return t_num.astype(float)
-    t_dt = pd.to_datetime(series, errors="coerce")
+    # Strip simple trailing timezone offsets like +09 or +09:00 before parsing.
+    s = series.astype(str).str.strip()
+    s = s.str.replace(r"([+-]\d{2})(?::?\d{2})?$", "", regex=True)
+    # Remove non-printable characters that can break parsing.
+    s = s.str.replace(r"[^\x20-\x7E]", "", regex=True)
+    t_dt = pd.to_datetime(s, errors="coerce")
+    if t_dt.isna().any():
+        mask = t_dt.isna()
+        # Retry common no-fraction format for remaining rows.
+        t_dt.loc[mask] = pd.to_datetime(s[mask], format="%Y-%m-%d %H:%M:%S", errors="coerce")
     if t_dt.notna().all():
         return t_dt.view("int64").astype(float)  # ns
-    raise ValueError("Time column is neither numeric nor datetime-parsable.")
+    # Surface a small sample to help identify bad formats.
+    bad_mask = t_dt.isna()
+    sample_raw = series.astype(str).head(5).tolist()
+    sample_clean = s.head(5).tolist()
+    bad_raw = series.astype(str)[bad_mask].head(5).tolist()
+    bad_clean = s[bad_mask].head(5).tolist()
+    raise ValueError(
+        "Time column is neither numeric nor datetime-parsable. "
+        f"sample_raw={sample_raw} sample_clean={sample_clean} "
+        f"bad_count={int(bad_mask.sum())} bad_raw={bad_raw} bad_clean={bad_clean}"
+    )
 
 
 def normalize_id_series(series: pd.Series) -> pd.Series:
@@ -236,8 +252,9 @@ def compute_plant_time_range_and_signal_count(
     *,
     map_encoding: Optional[str] = None,
     data_encoding: Optional[str] = None,
-) -> Tuple[Tuple[float, float], int, Dict[str, Tuple[str, SignalType]]]:
+) -> Tuple[Tuple[float, float], int, Dict[str, Tuple[str, SignalType]], int]:
     merged_mapping: Dict[str, Tuple[str, SignalType]] = {}
+    skipped = 0
     for path in plant_map_paths:
         df = read_csv_path(path, encoding=map_encoding)
         if df.shape[1] < 2:
@@ -247,8 +264,12 @@ def compute_plant_time_range_and_signal_count(
         signal_types_raw = df.iloc[:, -1].astype(str)
         mask = ids.notna() & signals.notna() & signal_types_raw.notna()
         for key, name, st_raw in zip(ids[mask], signals[mask], signal_types_raw[mask]):
+            st_str = str(st_raw).strip()
+            if not st_str or st_str.lower() == "nan":
+                skipped += 1
+                continue
             try:
-                st = SignalType(st_raw.strip())
+                st = SignalType(st_str)
             except Exception as ex:
                 raise ValueError(f"Invalid signal type '{st_raw}' in {path}.") from ex
             val = (name, st)
@@ -280,4 +301,4 @@ def compute_plant_time_range_and_signal_count(
     if t_min is None or t_max is None:
         raise ValueError("PlantDB CSVs have no valid time values.")
     signal_count = len({val[0] for val in merged_mapping.values()})
-    return (t_min, t_max), signal_count, merged_mapping
+    return (t_min, t_max), signal_count, merged_mapping, skipped

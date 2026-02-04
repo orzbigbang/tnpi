@@ -1,4 +1,5 @@
-﻿import streamlit as st
+import pandas as pd
+import streamlit as st
 
 from state import get_config
 from .handlers import confirm_samples
@@ -6,6 +7,8 @@ from .odg_inputs import render_odg_inputs
 from .plant_inputs import render_plant_inputs
 from .run_section import render_run_section
 from .sidebar import render_sidebar
+from .result import render_run_results
+from .inspector import render_compare_samples_inspector, render_confirm_samples_inspector
 
 
 def run() -> None:
@@ -36,6 +39,7 @@ def run() -> None:
 
     if app_cfg.state.plant_confirmed and app_cfg.state.odg_confirmed:
         # render_sidebar(app_cfg)
-        render_run_section(app_cfg)
+        render_confirm_samples_inspector(app_cfg.state.confirm_sample_inspector)
+        render_run_section(app_cfg, render_run_results)
     else:
         st.info("Confirm both ODG and PlantDB inputs to enable run options.")

@@ -1,17 +1,11 @@
-﻿import os
-from typing import Callable, Optional, Tuple
+﻿from typing import Callable, Optional, Tuple
 
 import pandas as pd
 
+from core.confirm import confirm_samples as confirm_samples_core
 from core.parallel import compute_accuracy_for_all_odg_mp
-from state import AppConfig, RunResult
-from core.io_csv import detect_csv_encoding
-from core.parse import (
-    compute_odg_meta,
-    compute_plant_time_range_and_signal_count,
-    load_odg_folder_from_dir,
-    load_plant_folder_from_dir,
-)
+from core.models import RunResult
+from state import AppConfig
 
 
 def confirm_samples(
@@ -19,91 +13,61 @@ def confirm_samples(
     odg_folder: str,
     plant_folder: str,
 ) -> Optional[str]:
-    odg_path = (odg_folder or "").strip()
-    plant_path = (plant_folder or "").strip()
-    if not odg_path or not plant_path:
-        return "Please enter both odg and plant folder paths before confirming."
-    odg_error = confirm_odg_folder(app_cfg, odg_path)
-    if odg_error:
-        return odg_error
-    plant_error = confirm_plant_folder(app_cfg, plant_path)
-    if plant_error:
+    app_cfg.state.confirm_sample_inspector = None
+    result = confirm_samples_core(odg_folder, plant_folder)
+    if not result.ok:
         reset_odg_state(app_cfg)
-        return plant_error
+        reset_plant_state(app_cfg)
+        msg = result.error or "Confirm sampling failed."
+        if result.error_code:
+            msg = f"{msg} (code: {result.error_code})"
+        return msg
+
+    odg_meta = result.odg_meta
+    plant_meta = result.plant_meta
+    if odg_meta is None or plant_meta is None:
+        reset_odg_state(app_cfg)
+        reset_plant_state(app_cfg)
+        return "Confirm sampling failed: incomplete metadata."
+
+    app_cfg.state.odg_folder = (odg_folder or "").strip()
+    app_cfg.state.plant_folder = (plant_folder or "").strip()
+
+    app_cfg.odg.odg_files = odg_meta.files
+    app_cfg.odg.odg_names = odg_meta.names
+    app_cfg.odg.odg_time_range = odg_meta.time_range
+    app_cfg.odg.odg_signal_count = odg_meta.signal_count
+    app_cfg.odg.odg_row_count = odg_meta.row_count
+    app_cfg.odg.odg_encoding = odg_meta.encoding
+
+    app_cfg.plant.plant_map_files = plant_meta.map_files
+    app_cfg.plant.plant_data_files = plant_meta.data_files
+    app_cfg.plant.plant_map_count = plant_meta.map_count
+    app_cfg.plant.plant_data_count = plant_meta.data_count
+    app_cfg.plant.plant_data_rows = plant_meta.data_rows
+    app_cfg.plant.plant_skipped_mappings = plant_meta.skipped_mappings
+    app_cfg.plant.plant_map_encoding = plant_meta.map_encoding
+    app_cfg.plant.plant_data_encoding = plant_meta.data_encoding
+    app_cfg.plant.plant_time_range = plant_meta.time_range
+    app_cfg.plant.plant_signal_count = plant_meta.signal_count
+    app_cfg.plant.plant_id_signal_map = plant_meta.id_signal_map
+
+    if app_cfg.odg.odg_time_range is not None:
+        t_min, t_max = app_cfg.odg.odg_time_range
+        dt_min = pd.to_datetime(int(t_min), unit="ns")
+        dt_max = pd.to_datetime(int(t_max), unit="ns")
+        app_cfg.state.range_start = dt_min.strftime("%Y-%m-%d-%H-%M")
+        app_cfg.state.range_end = dt_max.strftime("%Y-%m-%d-%H-%M")
+
+    app_cfg.state.odg_confirmed = True
+    app_cfg.state.plant_confirmed = True
+    app_cfg.state.confirm_sample_inspector = result.inspector
     overlap_error = validate_sampling_overlap(app_cfg)
     if overlap_error:
         reset_odg_state(app_cfg)
         reset_plant_state(app_cfg)
         return overlap_error
     app_cfg.dump_ini()
-    return None
-
-
-def confirm_odg_folder(app_cfg: AppConfig, folder_path: str) -> Optional[str]:
-    if not folder_path:
-        return "Please enter a folder path before confirming."
-    try:
-        app_cfg.state.odg_folder = folder_path
-        app_cfg.odg.odg_files = load_odg_folder_from_dir(folder_path)
-        encodings = {detect_csv_encoding(p) for p in app_cfg.odg.odg_files}
-        if len(encodings) > 1:
-            raise ValueError(f"ODG CSV encodings are inconsistent: {sorted(encodings)}")
-        app_cfg.odg.odg_encoding = next(iter(encodings)) if encodings else None
-        app_cfg.odg.odg_names = [os.path.basename(p) for p in app_cfg.odg.odg_files]
-        (
-            app_cfg.odg.odg_time_range,
-            app_cfg.odg.odg_signal_count,
-            app_cfg.odg.odg_row_count,
-        ) = compute_odg_meta(app_cfg.odg.odg_files, encoding=app_cfg.odg.odg_encoding)
-        if app_cfg.odg.odg_time_range is not None:
-            t_min, t_max = app_cfg.odg.odg_time_range
-            dt_min = pd.to_datetime(int(t_min), unit="ns")
-            dt_max = pd.to_datetime(int(t_max), unit="ns")
-            app_cfg.state.range_start = dt_min.strftime("%Y-%m-%d-%H-%M")
-            app_cfg.state.range_end = dt_max.strftime("%Y-%m-%d-%H-%M")
-        app_cfg.state.odg_confirmed = True
-    except Exception as ex:
-        reset_odg_state(app_cfg)
-        return f"ODG confirm failed: {ex}"
-    return None
-
-
-def confirm_plant_folder(app_cfg: AppConfig, folder_path: str) -> Optional[str]:
-    if not folder_path:
-        return "Please enter a folder path before confirming."
-    try:
-        app_cfg.state.plant_folder = folder_path
-        (
-            app_cfg.plant.plant_map_files,
-            app_cfg.plant.plant_data_files,
-            app_cfg.plant.plant_map_count,
-            app_cfg.plant.plant_data_count,
-            app_cfg.plant.plant_data_rows,
-        ) = load_plant_folder_from_dir(folder_path)
-        map_encodings = {detect_csv_encoding(p) for p in app_cfg.plant.plant_map_files}
-        if len(map_encodings) > 1:
-            raise ValueError(f"Plant map CSV encodings are inconsistent: {sorted(map_encodings)}")
-        app_cfg.plant.plant_map_encoding = next(iter(map_encodings)) if map_encodings else None
-        data_encodings = {detect_csv_encoding(p) for p in app_cfg.plant.plant_data_files}
-        if len(data_encodings) > 1:
-            raise ValueError(f"Plant data CSV encodings are inconsistent: {sorted(data_encodings)}")
-        app_cfg.plant.plant_data_encoding = next(iter(data_encodings)) if data_encodings else None
-        (
-            app_cfg.plant.plant_time_range,
-            app_cfg.plant.plant_signal_count,
-            app_cfg.plant.plant_id_signal_map,
-        ) = (
-            compute_plant_time_range_and_signal_count(
-                app_cfg.plant.plant_map_files,
-                app_cfg.plant.plant_data_files,
-                map_encoding=app_cfg.plant.plant_map_encoding,
-                data_encoding=app_cfg.plant.plant_data_encoding,
-            )
-        )
-        app_cfg.state.plant_confirmed = True
-    except Exception as ex:
-        reset_plant_state(app_cfg)
-        return f"PlantDB confirm failed: {ex}"
     return None
 
 
@@ -130,18 +94,22 @@ def compute_run_result(
     try:
         time_range = parse_time_range(range_mode, range_start, range_end)
     except ValueError as ex:
-        return RunResult(ok=False, error=str(ex))
+        return RunResult(ok=False, error=str(ex), error_code="INVALID_TIME_RANGE")
 
-    metrics, detail_all = compute_accuracy_for_all_odg_mp(
-        app_cfg.plant.plant_id_signal_map,
-        app_cfg.plant.plant_data_files,
-        app_cfg.odg.odg_files,
-        app_cfg.compare,
-        progress_cb=progress_cb,
-        time_range=time_range,
-        plant_data_encoding=app_cfg.plant.plant_data_encoding,
-        odg_encoding=app_cfg.odg.odg_encoding,
-    )
+    try:
+        metrics, detail_all, profile = compute_accuracy_for_all_odg_mp(
+            app_cfg.plant.plant_id_signal_map,
+            app_cfg.plant.plant_data_files,
+            app_cfg.odg.odg_files,
+            app_cfg.compare,
+            progress_cb=progress_cb,
+            time_range=time_range,
+            plant_data_encoding=app_cfg.plant.plant_data_encoding,
+            odg_encoding=app_cfg.odg.odg_encoding,
+        )
+    except Exception as ex:
+        return RunResult(ok=False, error=str(ex), error_code="RUN_FAILED")
+
     return RunResult(
         ok=True,
         summary=metrics["matching_score"],
@@ -150,6 +118,7 @@ def compute_run_result(
         correlation=metrics["correlation"],
         offset_ms=metrics["offset_ms"],
         detail=detail_all,
+        compute_inspector=profile,
     )
 
 
@@ -206,5 +175,6 @@ def reset_plant_state(
     plant_cfg.plant_map_count = None
     plant_cfg.plant_data_count = None
     plant_cfg.plant_data_rows = None
+    plant_cfg.plant_skipped_mappings = None
     plant_cfg.plant_map_encoding = None
     plant_cfg.plant_data_encoding = None

@@ -6,3 +6,4 @@ __pycache__/
 *.py[oc]
 *.spec
 プラント*/
+plugin/odg_accel/target/

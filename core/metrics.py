@@ -3,9 +3,10 @@ from typing import Dict, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
+import time
 
 from enum_types import SignalType
-from state import CompareConfig
+from core.models import CompareConfig
 from core.parse import parse_odg_time_series_csv, parse_plant_samples_csv
 
 EPS = 1e-12
@@ -143,16 +144,22 @@ def compute_compare_metrics(
     *,
     plant_encoding: Optional[str] = None,
     odg_encoding: Optional[str] = None,
-) -> Tuple[Dict[str, float], pd.DataFrame]:
+) -> Tuple[Dict[str, float], pd.DataFrame, Dict[str, float]]:
+    t0 = time.perf_counter()
+    profile: Dict[str, float] = {}
     if plant_cache is not None:
         t_l, y_l = plant_cache
     else:
         t_l, y_l = parse_plant_samples_csv(plant_data_path, id_to_signal, encoding=plant_encoding)
+    profile["parse_plant_ms"] = (time.perf_counter() - t0) * 1000.0
+    t1 = time.perf_counter()
     t_h, x_h = parse_odg_time_series_csv(odg_path, encoding=odg_encoding)
+    profile["parse_odg_ms"] = (time.perf_counter() - t1) * 1000.0
 
     t_plant = t_l.to_numpy(dtype=float)
     t_odg = t_h.to_numpy(dtype=float)
 
+    t2 = time.perf_counter()
     plant_order = np.argsort(t_plant)
     odg_order = np.argsort(t_odg)
     t_plant = t_plant[plant_order]
@@ -160,8 +167,10 @@ def compute_compare_metrics(
 
     y_l = y_l.iloc[plant_order].reset_index(drop=True)
     x_h = x_h.iloc[odg_order].reset_index(drop=True)
+    profile["sort_align_ms"] = (time.perf_counter() - t2) * 1000.0
 
     if time_range is not None:
+        t3 = time.perf_counter()
         start, end = time_range
         if start > end:
             raise ValueError("Time range start must be <= end.")
@@ -171,92 +180,127 @@ def compute_compare_metrics(
         t_odg = t_odg[odg_mask]
         y_l = y_l.iloc[plant_mask].reset_index(drop=True)
         x_h = x_h.iloc[odg_mask].reset_index(drop=True)
+        profile["range_filter_ms"] = (time.perf_counter() - t3) * 1000.0
 
+    t4 = time.perf_counter()
     common_cols = [c for c in y_l.columns if c in x_h.columns]
     if not common_cols:
         raise ValueError("No overlapping signal columns between plant and odg CSV.")
 
-    denom = {}
-    for c in common_cols:
-        xs = x_h[c].to_numpy(dtype=float)
-        if cfg.accuracy_denominator == "range":
-            d = np.nanmax(xs) - np.nanmin(xs)
-        elif cfg.accuracy_denominator == "std":
-            d = np.nanstd(xs)
+    x_common = x_h[common_cols].to_numpy(dtype=float)
+    y_common = y_l[common_cols].to_numpy(dtype=float)
+
+    if cfg.accuracy_denominator == "range":
+        denom_vals = np.nanmax(x_common, axis=0) - np.nanmin(x_common, axis=0)
+    elif cfg.accuracy_denominator == "std":
+        denom_vals = np.nanstd(x_common, axis=0)
+    else:
+        denom_vals = np.full(x_common.shape[1], np.nan, dtype=float)
+
+    df_x = pd.DataFrame(x_common, columns=common_cols)
+    df_x["t"] = t_odg
+    df_x = df_x.sort_values("t")
+    df_x = df_x.groupby("t", sort=True).first()
+    t_unique = df_x.index.to_numpy(dtype=float)
+    x_unique = df_x.to_numpy(dtype=float)
+
+    x_hat_mat = np.full((t_plant.shape[0], x_unique.shape[1]), np.nan, dtype=float)
+    interp_ok = np.zeros(x_unique.shape[1], dtype=bool)
+    if t_unique.size >= 2:
+        if cfg.out_of_range_policy == "clip":
+            t_plant_clip = np.clip(t_plant, t_unique[0], t_unique[-1])
         else:
-            d = None
-        denom[c] = d
+            t_plant_clip = np.clip(t_plant, t_unique[0], t_unique[-1])
+            out_mask = (t_plant < t_unique[0]) | (t_plant > t_unique[-1])
+
+        for i in range(x_unique.shape[1]):
+            xu = x_unique[:, i]
+            valid = np.isfinite(t_unique) & np.isfinite(xu)
+            if valid.sum() < 2:
+                continue
+            th = t_unique[valid]
+            xh = xu[valid]
+            if len(th) < 2:
+                continue
+            x_hat = np.interp(t_plant_clip, th, xh)
+            if cfg.out_of_range_policy != "clip":
+                x_hat = x_hat.astype(float, copy=False)
+                x_hat[out_mask] = np.nan
+            x_hat_mat[:, i] = x_hat
+            interp_ok[i] = True
+
+    ok = np.isfinite(y_common) & np.isfinite(x_hat_mat)
+    counts = ok.sum(axis=0)
+    use_cols = interp_ok & (counts > 0)
+
+    diff = y_common - x_hat_mat
+    diff[~ok] = np.nan
+    abs_diff = np.abs(diff)
+    rmse_vals = np.sqrt(np.nanmean(diff ** 2, axis=0))
+    mean_abs_err_vals = np.nanmean(abs_diff, axis=0)
+
+    if cfg.accuracy_denominator == "abs_truth":
+        s = np.abs(x_hat_mat) + EPS
+        r = abs_diff / s
+    else:
+        d = np.where(np.isfinite(denom_vals) & (denom_vals > EPS), denom_vals, 1.0)
+        r = abs_diff / (d + EPS)
+    point_acc = 1.0 - np.clip(r, 0.0, 1.0)
+    if cfg.aggregate_policy == "mean":
+        sig_acc_vals = np.nanmean(point_acc, axis=0)
+    else:
+        sig_acc_vals = np.nanmin(point_acc, axis=0)
+
+    y_masked = np.where(ok, y_common, np.nan)
+    x_masked = np.where(ok, x_hat_mat, np.nan)
+    mean_y = np.nanmean(y_masked, axis=0)
+    mean_x = np.nanmean(x_masked, axis=0)
+    yc = y_masked - mean_y
+    xc = x_masked - mean_x
+    denom_corr = np.maximum(counts - 1, 1)
+    cov = np.nansum(yc * xc, axis=0) / denom_corr
+    std_y = np.sqrt(np.nansum(yc * yc, axis=0) / denom_corr)
+    std_x = np.sqrt(np.nansum(xc * xc, axis=0) / denom_corr)
+    corr_vals = cov / (std_y * std_x)
+    corr_vals[counts < 2] = np.nan
 
     rows = []
     acc_values = []
     rmse_values = []
     corr_values = []
-
-    for c in common_cols:
-        xs = x_h[c].to_numpy(dtype=float)
-        ys = y_l[c].to_numpy(dtype=float)
-
-        valid = np.isfinite(t_odg) & np.isfinite(xs)
-        th = t_odg[valid]
-        xh = xs[valid]
-        if len(th) < 2:
+    for i, c in enumerate(common_cols):
+        if not use_cols[i]:
             continue
-        df_tmp = pd.DataFrame({"t": th, "x": xh}).drop_duplicates(subset=["t"]).sort_values("t")
-        th = df_tmp["t"].to_numpy(dtype=float)
-        xh = df_tmp["x"].to_numpy(dtype=float)
-        if len(th) < 2:
-            continue
-
-        x_hat = linear_interp_truth(th, xh, t_plant, cfg.out_of_range_policy)
-
-        ok = np.isfinite(ys) & np.isfinite(x_hat)
-        if ok.sum() == 0:
-            continue
-
-        diff = ys - x_hat
-        abs_diff = np.abs(diff)
-        rmse = float(np.sqrt(np.nanmean(diff[ok] ** 2)))
-        corr = float(np.corrcoef(ys[ok], x_hat[ok])[0, 1]) if ok.sum() > 1 else float("nan")
-
-        if cfg.accuracy_denominator == "abs_truth":
-            s = np.abs(x_hat) + EPS
-            r = abs_diff / s
-        else:
-            d = denom[c]
-            d = float(d) if (d is not None and d > EPS) else 1.0
-            r = abs_diff / (d + EPS)
-
-        point_acc = 1.0 - np.clip(r, 0.0, 1.0)
-        sig_acc = np.nanmean(point_acc[ok]) if cfg.aggregate_policy == "mean" else np.nanmin(point_acc[ok])
-
         rows.append(
             {
                 "signal": c,
-                "n_points_used": int(ok.sum()),
-                "matching_score": float(sig_acc),
-                "rmse": rmse,
-                "correlation": corr,
-                "mean_abs_error": float(np.nanmean(abs_diff[ok])),
+                "n_points_used": int(counts[i]),
+                "matching_score": float(sig_acc_vals[i]),
+                "rmse": float(rmse_vals[i]),
+                "correlation": float(corr_vals[i]),
+                "mean_abs_error": float(mean_abs_err_vals[i]),
             }
         )
-        acc_values.append(sig_acc)
-        rmse_values.append(rmse)
-        if np.isfinite(corr):
-            corr_values.append(corr)
+        acc_values.append(float(sig_acc_vals[i]))
+        rmse_values.append(float(rmse_vals[i]))
+        if np.isfinite(corr_vals[i]):
+            corr_values.append(float(corr_vals[i]))
+    profile["per_signal_ms"] = (time.perf_counter() - t4) * 1000.0
 
+    t5 = time.perf_counter()
     detail = pd.DataFrame(rows).sort_values("matching_score", ascending=True)
     matching_score = float(np.nanmean(acc_values)) if acc_values else float("nan")
     rmse_avg = float(np.nanmean(rmse_values)) if rmse_values else float("nan")
     corr_avg = float(np.nanmean(corr_values)) if corr_values else float("nan")
 
-    x_common = x_h[common_cols].to_numpy(dtype=float)
-    y_common = y_l[common_cols].to_numpy(dtype=float)
     x_mean = np.nanmean(x_common, axis=1)
     y_mean = np.nanmean(y_common, axis=1)
     offset_ms = estimate_offset_ms(t_odg, x_mean, t_plant, y_mean)
     if not detail.empty:
         detail = detail.copy()
         detail["offset_ms"] = float(offset_ms)
+    profile["offset_estimate_ms"] = (time.perf_counter() - t5) * 1000.0
+    profile["total_ms"] = (time.perf_counter() - t0) * 1000.0
 
     metrics = {
         "matching_score": matching_score,
@@ -264,4 +308,4 @@ def compute_compare_metrics(
         "correlation": corr_avg,
         "offset_ms": float(offset_ms),
     }
-    return metrics, detail
+    return metrics, detail, profile

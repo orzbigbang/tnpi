@@ -42,4 +42,8 @@ def render_plant_inputs(app_cfg: AppConfig) -> str:
             plant_meta_placeholder.caption(
                 f"PlantDB rows: {app_cfg.plant.plant_data_rows}"
             )
+        if app_cfg.plant.plant_skipped_mappings is not None:
+            plant_meta_placeholder.caption(
+                f"PlantDB skipped mappings: {app_cfg.plant.plant_skipped_mappings}"
+            )
     return plant_folder

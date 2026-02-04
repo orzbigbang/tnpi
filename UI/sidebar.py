@@ -1,6 +1,7 @@
 ﻿import streamlit as st
 
-from state import AppConfig, CompareConfig
+from core.models import CompareConfig
+from state import AppConfig
 
 
 def render_sidebar(app_cfg: AppConfig) -> CompareConfig:

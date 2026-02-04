@@ -3,8 +3,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Optional, Tuple, Union
 
 import pandas as pd
+import numpy as np
 
-from state import CompareConfig
+from core.models import CompareConfig
 from core.metrics import compute_compare_metrics
 from core.parse import parse_plant_samples_csv
 
@@ -29,11 +30,11 @@ def _compute_one(
     cfg: CompareConfig,
     time_range: Optional[Tuple[float, float]],
     odg_encoding: Optional[str],
-) -> Tuple[str, dict, pd.DataFrame, str]:
+) -> Tuple[str, dict, pd.DataFrame, dict, str]:
     try:
         if _PLANT_CACHE is None:
             raise ValueError("Plant data cache is not initialized.")
-        metrics, detail = compute_compare_metrics(
+        metrics, detail, profile = compute_compare_metrics(
             {},
             "",
             odg_path,
@@ -42,9 +43,9 @@ def _compute_one(
             plant_cache=_PLANT_CACHE,
             odg_encoding=odg_encoding,
         )
-        return os.path.basename(odg_path), metrics, detail, ""
+        return os.path.basename(odg_path), metrics, detail, profile, ""
     except Exception as ex:
-        return os.path.basename(odg_path), {}, pd.DataFrame(), str(ex)
+        return os.path.basename(odg_path), {}, pd.DataFrame(), {}, str(ex)
 
 
 def compute_accuracy_for_all_odg_mp(
@@ -58,7 +59,7 @@ def compute_accuracy_for_all_odg_mp(
     *,
     plant_data_encoding: Optional[str] = None,
     odg_encoding: Optional[str] = None,
-) -> Tuple[dict, pd.DataFrame]:
+) -> Tuple[dict, pd.DataFrame, dict]:
     worker_count = max_workers or (os.cpu_count() or 1)
     if not id_to_signal or not plant_data_files:
         raise ValueError("PlantDB ID-to-signal mapping and data CSV paths are required.")
@@ -76,8 +77,9 @@ def compute_accuracy_for_all_odg_mp(
         total = len(futures)
         if progress_cb:
             progress_cb(0, total)
+        profile_rows = []
         for fut in as_completed(futures):
-            name, metrics, detail, err = fut.result()
+            name, metrics, detail, profile, err = fut.result()
             summary_rows.append(
                 {
                     "odg_csv": name,
@@ -93,6 +95,8 @@ def compute_accuracy_for_all_odg_mp(
                 detail = detail.copy()
                 detail.insert(0, "odg_csv", name)
                 detail_rows.append(detail)
+            if profile:
+                profile_rows.append(profile)
             completed += 1
             if progress_cb:
                 progress_cb(completed, total)
@@ -110,4 +114,12 @@ def compute_accuracy_for_all_odg_mp(
     else:
         detail_all = pd.DataFrame()
 
-    return avg, detail_all
+    profile_summary = {}
+    if profile_rows:
+        keys = sorted({k for row in profile_rows for k in row.keys()})
+        for k in keys:
+            vals = [row.get(k) for row in profile_rows if row.get(k) is not None]
+            if vals:
+                profile_summary[k] = float(np.mean(vals))
+
+    return avg, detail_all, profile_summary

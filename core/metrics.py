@@ -10,7 +10,7 @@ from core.models import CompareConfig
 from core.parse import parse_odg_time_series_csv, parse_plant_samples_csv
 
 EPS = 1e-12
-OFFSET_SEARCH_MS = 12000
+OFFSET_SEARCH_MS = 120000
 OFFSET_GRID_MS = 50
 OFFSET_MIN_POINTS = 30
 
@@ -31,86 +31,126 @@ def linear_interp_truth(
     return x_hat
 
 
-def _to_datetime_ns(t_vals: np.ndarray) -> pd.Series:
-    t_num = pd.to_numeric(t_vals, errors="coerce")
-    t_int = pd.Series(t_num, copy=False).astype("Int64")
-    return pd.to_datetime(t_int, unit="ns", errors="coerce")
+def _as_int64_ns(t_vals: np.ndarray) -> np.ndarray:
+    t = np.asarray(t_vals)
+    if np.issubdtype(t.dtype, np.datetime64):
+        return t.astype("datetime64[ns]").astype("int64")
+
+    arr = np.asarray(t_vals, dtype="float64")
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return np.asarray([], dtype="int64")
+
+    med = float(np.median(np.abs(finite)))
+    if med < 1e11:
+        scale = 1e9
+    elif med < 1e15:
+        scale = 1e6
+    else:
+        scale = 1.0
+
+    return (arr * scale).round().astype("int64")
 
 
-def fast_estimate_offset_ms_resample(
-    t1: pd.DataFrame,
-    t2: pd.DataFrame,
-    grid_ms: int,
-    search_ms: int,
-) -> float:
-    t1_min, t1_max = t1["ts"].min(), t1["ts"].max()
-    t2_min, t2_max = t2["ts"].min(), t2["ts"].max()
+def _prepare_series(t_ns: np.ndarray, v: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    t = np.asarray(t_ns, dtype="int64")
+    x = np.asarray(v, dtype="float64")
 
-    start = max(t1_min, t2_min - pd.to_timedelta(search_ms, unit="ms"))
-    end = min(t1_max, t2_max + pd.to_timedelta(search_ms, unit="ms"))
-    if start >= end:
+    m = np.isfinite(x) & np.isfinite(t.astype("float64"))
+    t = t[m]
+    x = x[m]
+    if t.size == 0:
+        return t, x
+
+    order = np.argsort(t)
+    t = t[order]
+    x = x[order]
+
+    t_rev = t[::-1]
+    x_rev = x[::-1]
+    _, idx = np.unique(t_rev, return_index=True)
+    keep_rev = np.sort(idx)
+    t_u = t_rev[keep_rev][::-1]
+    x_u = x_rev[keep_rev][::-1]
+    return t_u, x_u
+
+
+def _interp_to_grid(t_ns: np.ndarray, v: np.ndarray, grid_ns: np.ndarray) -> np.ndarray:
+    t_u, x_u = _prepare_series(t_ns, v)
+    if t_u.size < 2:
+        return np.full(grid_ns.shape, np.nan, dtype="float64")
+
+    left = t_u[0]
+    right = t_u[-1]
+    g_clip = np.clip(grid_ns, left, right)
+    y = np.interp(g_clip.astype("float64"), t_u.astype("float64"), x_u.astype("float64")).astype("float64")
+
+    out = (grid_ns < left) | (grid_ns > right)
+    y[out] = np.nan
+    return y
+
+
+def _next_pow2(n: int) -> int:
+    n = int(n)
+    if n <= 1:
+        return 1
+    return 1 << (n - 1).bit_length()
+
+
+def _fft_xcorr_best_lag(a: np.ndarray, b: np.ndarray, max_shift: int, min_points: int) -> float:
+    a = np.asarray(a, dtype="float64")
+    b = np.asarray(b, dtype="float64")
+    if a.size != b.size or a.size == 0:
         return float("nan")
 
-    grid = pd.date_range(start=start, end=end, freq=f"{grid_ms}ms")
-    s1 = (
-        t1.set_index("ts")["v1"]
-        .sort_index()
-        .resample(f"{grid_ms}ms")
-        .median()
-        .reindex(grid)
-    )
-    s2 = (
-        t2.set_index("ts")["v2"]
-        .sort_index()
-        .reindex(grid)
-        .interpolate(method="time", limit_direction="both")
-    )
-
-    a = s1.to_numpy(dtype="float64")
-    b = s2.to_numpy(dtype="float64")
-
-    valid = np.isfinite(a) & np.isfinite(b)
-    if valid.sum() < OFFSET_MIN_POINTS:
+    ma = np.isfinite(a)
+    mb = np.isfinite(b)
+    if int(ma.sum()) < min_points or int(mb.sum()) < min_points:
         return float("nan")
 
-    a = a[valid]
-    b = b[valid]
-
-    def z(x: np.ndarray) -> np.ndarray:
-        m = np.mean(x)
-        sd = np.std(x)
+    def z(x: np.ndarray, m: np.ndarray) -> np.ndarray:
+        xv = x[m]
+        mu = float(np.mean(xv)) if xv.size else 0.0
+        sd = float(np.std(xv)) if xv.size else 0.0
         if not np.isfinite(sd) or sd < 1e-12:
-            return x - m
-        return (x - m) / sd
+            sd = 1.0
+        y = (x - mu) / sd
+        y[~m] = 0.0
+        return y
 
-    a = z(a)
-    b = z(b)
+    a0 = z(a, ma)
+    b0 = z(b, mb)
 
-    max_shift = int(search_ms // grid_ms)
-    best_shift = 0
-    best_rmse = float("inf")
+    am = ma.astype("float64")
+    bm = mb.astype("float64")
 
-    for sh in range(-max_shift, max_shift + 1):
-        if sh < 0:
-            aa = a[-sh:]
-            bb = b[:len(aa)]
-        elif sh > 0:
-            bb = b[sh:]
-            aa = a[:len(bb)]
-        else:
-            aa = a
-            bb = b
+    n = a0.size
+    size = _next_pow2(2 * n - 1)
 
-        if len(aa) < OFFSET_MIN_POINTS:
-            continue
+    A = np.fft.rfft(a0, size)
+    B = np.fft.rfft(b0, size)
+    AM = np.fft.rfft(am, size)
+    BM = np.fft.rfft(bm, size)
 
-        diff = aa - bb
-        rmse = float(np.sqrt(np.mean(diff * diff)))
-        if rmse < best_rmse:
-            best_rmse = rmse
-            best_shift = sh
+    corr = np.fft.irfft(A * np.conj(B), size)[: 2 * n - 1]
+    overlap = np.fft.irfft(AM * np.conj(BM), size)[: 2 * n - 1]
 
-    return float(best_shift * grid_ms)
+    lags = np.arange(-(n - 1), n, dtype="int64")
+    w = (lags >= -max_shift) & (lags <= max_shift)
+    if not np.any(w):
+        return float("nan")
+
+    corr_w = corr[w]
+    ov_w = overlap[w]
+    lags_w = lags[w]
+
+    ok = ov_w >= float(min_points)
+    if not np.any(ok):
+        return float("nan")
+
+    score = corr_w[ok] / (ov_w[ok] + EPS)
+    best = int(np.argmax(score))
+    return float(lags_w[ok][best])
 
 
 def estimate_offset_ms(
@@ -121,17 +161,43 @@ def estimate_offset_ms(
     grid_ms: int = OFFSET_GRID_MS,
     search_ms: int = OFFSET_SEARCH_MS,
 ) -> float:
-    t1_dt = _to_datetime_ns(t1_ns)
-    t2_dt = _to_datetime_ns(t2_ns)
-    mask1 = t1_dt.notna().to_numpy() & np.isfinite(v1)
-    mask2 = t2_dt.notna().to_numpy() & np.isfinite(v2)
-    if mask1.sum() < OFFSET_MIN_POINTS or mask2.sum() < OFFSET_MIN_POINTS:
+    t1i = _as_int64_ns(t1_ns)
+    t2i = _as_int64_ns(t2_ns)
+
+    v1 = np.asarray(v1, dtype="float64")
+    v2 = np.asarray(v2, dtype="float64")
+
+    t1u, v1u = _prepare_series(t1i, v1)
+    t2u, v2u = _prepare_series(t2i, v2)
+    if t1u.size < 2 or t2u.size < 2:
         return float("nan")
-    t1 = pd.DataFrame({"ts": t1_dt[mask1].to_numpy(), "v1": v1[mask1]})
-    t2 = pd.DataFrame({"ts": t2_dt[mask2].to_numpy(), "v2": v2[mask2]})
-    if t1.empty or t2.empty:
+
+    step_ns = int(grid_ms) * 1_000_000
+    search_ns = int(search_ms) * 1_000_000
+
+    t1_min, t1_max = int(t1u[0]), int(t1u[-1])
+    t2_min, t2_max = int(t2u[0]), int(t2u[-1])
+
+    start = max(t1_min, t2_min - search_ns)
+    end = min(t1_max, t2_max + search_ns)
+    if start >= end:
         return float("nan")
-    return fast_estimate_offset_ms_resample(t1, t2, grid_ms=grid_ms, search_ms=search_ms)
+
+    n_steps = int((end - start) // step_ns) + 1
+    if n_steps < OFFSET_MIN_POINTS:
+        return float("nan")
+
+    grid = start + np.arange(n_steps, dtype="int64") * step_ns
+
+    a = _interp_to_grid(t1u, v1u, grid)
+    b = _interp_to_grid(t2u, v2u, grid)
+
+    max_shift = int(search_ms // grid_ms)
+    best_lag = _fft_xcorr_best_lag(a, b, max_shift=max_shift, min_points=OFFSET_MIN_POINTS)
+    if not np.isfinite(best_lag):
+        return float("nan")
+
+    return float(best_lag * grid_ms)
 
 
 def compute_compare_metrics(
@@ -169,137 +235,124 @@ def compute_compare_metrics(
     x_h = x_h.iloc[odg_order].reset_index(drop=True)
     profile["sort_align_ms"] = (time.perf_counter() - t2) * 1000.0
 
+    t_plant_ns = _as_int64_ns(t_plant)
+    t_odg_ns = _as_int64_ns(t_odg)
+    t_plant_f = t_plant_ns.astype(float)
+    t_odg_f = t_odg_ns.astype(float)
+
     if time_range is not None:
         t3 = time.perf_counter()
         start, end = time_range
         if start > end:
             raise ValueError("Time range start must be <= end.")
-        plant_mask = (t_plant >= start) & (t_plant <= end)
-        odg_mask = (t_odg >= start) & (t_odg <= end)
-        t_plant = t_plant[plant_mask]
-        t_odg = t_odg[odg_mask]
+        start_ns = _as_int64_ns(np.asarray([start], dtype="float64"))[0]
+        end_ns = _as_int64_ns(np.asarray([end], dtype="float64"))[0]
+        plant_mask = (t_plant_ns >= start_ns) & (t_plant_ns <= end_ns)
+        odg_mask = (t_odg_ns >= start_ns) & (t_odg_ns <= end_ns)
+        t_plant_ns = t_plant_ns[plant_mask]
+        t_odg_ns = t_odg_ns[odg_mask]
+        t_plant_f = t_plant_ns.astype(float)
+        t_odg_f = t_odg_ns.astype(float)
         y_l = y_l.iloc[plant_mask].reset_index(drop=True)
         x_h = x_h.iloc[odg_mask].reset_index(drop=True)
         profile["range_filter_ms"] = (time.perf_counter() - t3) * 1000.0
 
-    t4 = time.perf_counter()
     common_cols = [c for c in y_l.columns if c in x_h.columns]
     if not common_cols:
         raise ValueError("No overlapping signal columns between plant and odg CSV.")
 
+    denom: Dict[str, Optional[float]] = {}
+    for c in common_cols:
+        xs = x_h[c].to_numpy(dtype=float)
+        if cfg.accuracy_denominator == "range":
+            d = np.nanmax(xs) - np.nanmin(xs)
+        elif cfg.accuracy_denominator == "std":
+            d = np.nanstd(xs)
+        else:
+            d = None
+        denom[c] = d
+
+    t4 = time.perf_counter()
     x_common = x_h[common_cols].to_numpy(dtype=float)
     y_common = y_l[common_cols].to_numpy(dtype=float)
+    x_mean = np.nanmean(x_common, axis=1)
+    y_mean = np.nanmean(y_common, axis=1)
+    offset_ms = estimate_offset_ms(t_odg_ns, x_mean, t_plant_ns, y_mean)
 
-    if cfg.accuracy_denominator == "range":
-        denom_vals = np.nanmax(x_common, axis=0) - np.nanmin(x_common, axis=0)
-    elif cfg.accuracy_denominator == "std":
-        denom_vals = np.nanstd(x_common, axis=0)
-    else:
-        denom_vals = np.full(x_common.shape[1], np.nan, dtype=float)
+    t_plant_aligned_f = t_plant_f.copy()
+    if np.isfinite(offset_ms):
+        t_plant_aligned_f = t_plant_f - float(offset_ms) * 1_000_000.0
+    profile["offset_estimate_ms"] = (time.perf_counter() - t4) * 1000.0
 
-    df_x = pd.DataFrame(x_common, columns=common_cols)
-    df_x["t"] = t_odg
-    df_x = df_x.sort_values("t")
-    df_x = df_x.groupby("t", sort=True).first()
-    t_unique = df_x.index.to_numpy(dtype=float)
-    x_unique = df_x.to_numpy(dtype=float)
-
-    x_hat_mat = np.full((t_plant.shape[0], x_unique.shape[1]), np.nan, dtype=float)
-    interp_ok = np.zeros(x_unique.shape[1], dtype=bool)
-    if t_unique.size >= 2:
-        if cfg.out_of_range_policy == "clip":
-            t_plant_clip = np.clip(t_plant, t_unique[0], t_unique[-1])
-        else:
-            t_plant_clip = np.clip(t_plant, t_unique[0], t_unique[-1])
-            out_mask = (t_plant < t_unique[0]) | (t_plant > t_unique[-1])
-
-        for i in range(x_unique.shape[1]):
-            xu = x_unique[:, i]
-            valid = np.isfinite(t_unique) & np.isfinite(xu)
-            if valid.sum() < 2:
-                continue
-            th = t_unique[valid]
-            xh = xu[valid]
-            if len(th) < 2:
-                continue
-            x_hat = np.interp(t_plant_clip, th, xh)
-            if cfg.out_of_range_policy != "clip":
-                x_hat = x_hat.astype(float, copy=False)
-                x_hat[out_mask] = np.nan
-            x_hat_mat[:, i] = x_hat
-            interp_ok[i] = True
-
-    ok = np.isfinite(y_common) & np.isfinite(x_hat_mat)
-    counts = ok.sum(axis=0)
-    use_cols = interp_ok & (counts > 0)
-
-    diff = y_common - x_hat_mat
-    diff[~ok] = np.nan
-    abs_diff = np.abs(diff)
-    rmse_vals = np.sqrt(np.nanmean(diff ** 2, axis=0))
-    mean_abs_err_vals = np.nanmean(abs_diff, axis=0)
-
-    if cfg.accuracy_denominator == "abs_truth":
-        s = np.abs(x_hat_mat) + EPS
-        r = abs_diff / s
-    else:
-        d = np.where(np.isfinite(denom_vals) & (denom_vals > EPS), denom_vals, 1.0)
-        r = abs_diff / (d + EPS)
-    point_acc = 1.0 - np.clip(r, 0.0, 1.0)
-    if cfg.aggregate_policy == "mean":
-        sig_acc_vals = np.nanmean(point_acc, axis=0)
-    else:
-        sig_acc_vals = np.nanmin(point_acc, axis=0)
-
-    y_masked = np.where(ok, y_common, np.nan)
-    x_masked = np.where(ok, x_hat_mat, np.nan)
-    mean_y = np.nanmean(y_masked, axis=0)
-    mean_x = np.nanmean(x_masked, axis=0)
-    yc = y_masked - mean_y
-    xc = x_masked - mean_x
-    denom_corr = np.maximum(counts - 1, 1)
-    cov = np.nansum(yc * xc, axis=0) / denom_corr
-    std_y = np.sqrt(np.nansum(yc * yc, axis=0) / denom_corr)
-    std_x = np.sqrt(np.nansum(xc * xc, axis=0) / denom_corr)
-    corr_vals = cov / (std_y * std_x)
-    corr_vals[counts < 2] = np.nan
-
+    t5 = time.perf_counter()
     rows = []
     acc_values = []
     rmse_values = []
     corr_values = []
-    for i, c in enumerate(common_cols):
-        if not use_cols[i]:
+
+    for c in common_cols:
+        xs = x_h[c].to_numpy(dtype=float)
+        ys = y_l[c].to_numpy(dtype=float)
+
+        valid = np.isfinite(t_odg_f) & np.isfinite(xs)
+        th = t_odg_f[valid]
+        xh = xs[valid]
+        if th.size < 2:
             continue
+
+        df_tmp = pd.DataFrame({"t": th, "x": xh}).drop_duplicates(subset=["t"]).sort_values("t")
+        th = df_tmp["t"].to_numpy(dtype=float)
+        xh = df_tmp["x"].to_numpy(dtype=float)
+        if th.size < 2:
+            continue
+
+        x_hat = linear_interp_truth(th, xh, t_plant_aligned_f, cfg.out_of_range_policy)
+
+        ok = np.isfinite(ys) & np.isfinite(x_hat)
+        if ok.sum() == 0:
+            continue
+
+        diff = ys - x_hat
+        abs_diff = np.abs(diff)
+
+        rmse = float(np.sqrt(np.nanmean(diff[ok] ** 2)))
+        corr = float(np.corrcoef(ys[ok], x_hat[ok])[0, 1]) if ok.sum() > 1 else float("nan")
+
+        if cfg.accuracy_denominator == "abs_truth":
+            s = np.abs(x_hat) + EPS
+            r = abs_diff / s
+        else:
+            d = denom[c]
+            d = float(d) if (d is not None and d > EPS) else 1.0
+            r = abs_diff / (d + EPS)
+
+        point_acc = 1.0 - np.clip(r, 0.0, 1.0)
+        sig_acc = np.nanmean(point_acc[ok]) if cfg.aggregate_policy == "mean" else np.nanmin(point_acc[ok])
+
         rows.append(
             {
                 "signal": c,
-                "n_points_used": int(counts[i]),
-                "matching_score": float(sig_acc_vals[i]),
-                "rmse": float(rmse_vals[i]),
-                "correlation": float(corr_vals[i]),
-                "mean_abs_error": float(mean_abs_err_vals[i]),
+                "n_points_used": int(ok.sum()),
+                "matching_score": float(sig_acc),
+                "rmse": rmse,
+                "correlation": corr,
+                "mean_abs_error": float(np.nanmean(abs_diff[ok])),
+                "offset_ms": float(offset_ms),
             }
         )
-        acc_values.append(float(sig_acc_vals[i]))
-        rmse_values.append(float(rmse_vals[i]))
-        if np.isfinite(corr_vals[i]):
-            corr_values.append(float(corr_vals[i]))
-    profile["per_signal_ms"] = (time.perf_counter() - t4) * 1000.0
+        acc_values.append(float(sig_acc))
+        rmse_values.append(float(rmse))
+        if np.isfinite(corr):
+            corr_values.append(float(corr))
 
-    t5 = time.perf_counter()
-    detail = pd.DataFrame(rows).sort_values("matching_score", ascending=True)
+    detail = pd.DataFrame(rows)
+    if not detail.empty:
+        detail = detail.sort_values("matching_score", ascending=True)
+
     matching_score = float(np.nanmean(acc_values)) if acc_values else float("nan")
     rmse_avg = float(np.nanmean(rmse_values)) if rmse_values else float("nan")
     corr_avg = float(np.nanmean(corr_values)) if corr_values else float("nan")
-
-    x_mean = np.nanmean(x_common, axis=1)
-    y_mean = np.nanmean(y_common, axis=1)
-    offset_ms = estimate_offset_ms(t_odg, x_mean, t_plant, y_mean)
-    if not detail.empty:
-        detail = detail.copy()
-        detail["offset_ms"] = float(offset_ms)
-    profile["offset_estimate_ms"] = (time.perf_counter() - t5) * 1000.0
+    profile["per_signal_ms"] = (time.perf_counter() - t5) * 1000.0
     profile["total_ms"] = (time.perf_counter() - t0) * 1000.0
 
     metrics = {

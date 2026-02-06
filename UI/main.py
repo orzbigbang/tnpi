@@ -6,6 +6,7 @@ from UI.handlers import confirm_samples
 from UI.odg_inputs import render_odg_inputs
 from UI.plant_inputs import render_plant_inputs
 from UI.run_section import render_run_section
+from UI.sidebar import render_sidebar
 from UI.result import render_run_results
 from UI.inspector import render_compare_samples_inspector, render_confirm_samples_inspector
 
@@ -36,6 +37,7 @@ def run():
             st.rerun()
 
     if app_cfg.state.plant_confirmed and app_cfg.state.odg_confirmed:
+        # render_sidebar(app_cfg)
         render_confirm_samples_inspector(app_cfg.state.confirm_sample_inspector)
         render_run_section(app_cfg, render_run_results)
     else:

@@ -59,11 +59,19 @@ def compute_accuracy_for_all_odg_mp(
     *,
     plant_data_encoding: Optional[str] = None,
     odg_encoding: Optional[str] = None,
+    selected_plant_data_path: Optional[str] = None,
 ) -> Tuple[dict, pd.DataFrame, dict]:
     worker_count = max_workers or (os.cpu_count() or 1)
     if not id_to_signal or not plant_data_files:
         raise ValueError("PlantDB ID-to-signal mapping and data CSV paths are required.")
-    plant_data_path = plant_data_files[0]
+    plant_data_path = (selected_plant_data_path or "").strip()
+    if plant_data_path:
+        if plant_data_path not in plant_data_files:
+            raise ValueError(
+                f"Selected PlantDB data file is not available: {plant_data_path}"
+            )
+    else:
+        plant_data_path = plant_data_files[0]
     summary_rows = []
     detail_rows = []
 

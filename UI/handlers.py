@@ -91,6 +91,7 @@ def compute_run_result(
     range_mode: str,
     range_start: str,
     range_end: str,
+    selected_plant_data_path: Optional[str],
     progress_cb: Callable,
 ) -> RunResult:
     try:
@@ -108,6 +109,7 @@ def compute_run_result(
             time_range=time_range,
             plant_data_encoding=app_cfg.plant.plant_data_encoding,
             odg_encoding=app_cfg.odg.odg_encoding,
+            selected_plant_data_path=selected_plant_data_path,
         )
     except Exception as ex:
         return RunResult(ok=False, error=str(ex), error_code="RUN_FAILED")

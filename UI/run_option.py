@@ -7,21 +7,8 @@ import streamlit as st
 from state import AppConfig
 
 
-def render_run_option(app_cfg: AppConfig) -> Tuple[str, str, str]:
+def render_run_option(app_cfg: AppConfig) -> Tuple[str, str, str, Optional[str]]:
     st.subheader("Run options")
-    st.markdown(
-        """
-        <style>
-        div.stButton > button {
-            min-height: 2.7rem;
-            min-width: 4.4rem;
-            font-size: 1rem;
-            font-weight: 600;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
     st.markdown("Select HML")
     hml_cols = st.columns([1, 1, 1, 6], gap="small")
     with hml_cols[0]:
@@ -31,9 +18,6 @@ def render_run_option(app_cfg: AppConfig) -> Tuple[str, str, str]:
     with hml_cols[2]:
         st.button("L", key="hml_l", use_container_width=True)
 
-    if app_cfg.state.range_mode != "range":
-        app_cfg.state.range_mode = "range"
-        app_cfg.dump_ini()
     selected_key = "selected_quick_range"
     mode_key = "selected_quick_range_mode"
     start_key = "range_start_input"
@@ -82,7 +66,7 @@ def render_run_option(app_cfg: AppConfig) -> Tuple[str, str, str]:
 
     if selected_range is None:
         st.caption("Choose one quick range before running.")
-        return "range", "", ""
+        return "range", "", "", None
 
     selected_start_ns = selected_range[1]
     selected_end_ns = selected_range[2]
@@ -102,7 +86,7 @@ def render_run_option(app_cfg: AppConfig) -> Tuple[str, str, str]:
         st.session_state[start_key] = range_start
         st.session_state[end_key] = range_end
         st.caption("Using full selected quick-range overlap.")
-        return "range", range_start, range_end
+        return "range", range_start, range_end, selected_range[0]
 
     raw_start = str(st.session_state.get(start_key, app_cfg.state.range_start or _fmt_ns(selected_start_ns)))
     raw_end = str(st.session_state.get(end_key, app_cfg.state.range_end or _fmt_ns(selected_end_ns)))
@@ -142,7 +126,7 @@ def render_run_option(app_cfg: AppConfig) -> Tuple[str, str, str]:
             f"{text_bounds[0]} ~ {text_bounds[1]}."
         )
 
-    return "range", range_start, range_end
+    return "range", range_start, range_end, selected_range[0]
 
 
 def _fmt_ns(ts_ns: float) -> str:

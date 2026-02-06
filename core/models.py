@@ -57,7 +57,6 @@ class StateConfig:
     is_running: bool = False
     range_start: str = ""
     range_end: str = ""
-    range_mode: str = "full"
     odg_folder: str = ""
     plant_folder: str = ""
     odg_confirmed: bool = False
@@ -110,7 +109,6 @@ class AppConfig:
         os.makedirs(os.path.dirname(ini_path), exist_ok=True)
         parser = configparser.ConfigParser()
         parser["state"] = {
-            "range_mode": self.state.range_mode,
             "odg_folder": self.state.odg_folder,
             "plant_folder": self.state.plant_folder,
         }
@@ -139,7 +137,6 @@ class AppConfig:
         parser.read(ini_path, encoding="utf-8")
         config = cls()
         if parser.has_section("state"):
-            config.state.range_mode = parser.get("state", "range_mode", fallback=config.state.range_mode)
             config.state.odg_folder = parser.get(
                 "state",
                 "odg_folder",

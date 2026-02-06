@@ -31,7 +31,7 @@ def parse_time_values(series: pd.Series) -> pd.Series:
         # Retry common no-fraction format for remaining rows.
         t_dt.loc[mask] = pd.to_datetime(s[mask], format="%Y-%m-%d %H:%M:%S", errors="coerce")
     if t_dt.notna().all():
-        return t_dt.view("int64").astype(float)  # ns
+        return t_dt.astype("int64", copy=False).astype(float)  # ns
     # Surface a small sample to help identify bad formats.
     bad_mask = t_dt.isna()
     sample_raw = series.astype(str).head(5).tolist()
@@ -79,7 +79,7 @@ def parse_odg_time_series_csv(
     if not dt.notna().all():
         raise ValueError("ODG Date/Time columns are not datetime-parsable.")
 
-    t_vals = dt.view("int64").astype(float)  # ns
+    t_vals = dt.astype("int64", copy=False).astype(float)  # ns
     drop_cols = [date_col, time_col2] + ([ms_col] if ms_col else [])
     signals = df.drop(columns=drop_cols)
     signals = signals.apply(pd.to_numeric, errors="coerce")
@@ -230,7 +230,7 @@ def compute_odg_meta(
                     ms = pd.to_numeric(time_df[time_df.columns[2]], errors="coerce")
                     dt = dt + pd.to_timedelta(ms.fillna(0), unit="ms")
                 if dt.notna().any():
-                    t_vals = dt.view("int64").astype(float)
+                    t_vals = dt.astype("int64", copy=False).astype(float)
                     cur_min = float(np.nanmin(t_vals))
                     cur_max = float(np.nanmax(t_vals))
                     if t_min is None or cur_min < t_min:

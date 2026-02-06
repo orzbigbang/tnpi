@@ -1,4 +1,4 @@
-﻿from dataclasses import dataclass, field
+from dataclasses import dataclass, field
 import configparser
 import os
 from typing import Any, Dict, List, Optional, Tuple, Literal
@@ -80,6 +80,7 @@ class OdgConfig:
 class PlantConfig:
     plant_time_range: Optional[Tuple[float, float]] = None
     plant_signal_count: Optional[int] = None
+    plant_data_spans: List[Tuple[str, float, float]] = field(default_factory=list)
     plant_map_files: List[str] = field(default_factory=list)
     plant_data_files: List[str] = field(default_factory=list)
     plant_id_signal_map: Dict[str, Tuple[str, "SignalType"]] = field(default_factory=dict)
@@ -184,6 +185,7 @@ class OdgMeta:
 class PlantMeta:
     map_files: List[str]
     data_files: List[str]
+    data_spans: List[Tuple[str, float, float]]
     map_count: Optional[int]
     data_count: Optional[int]
     data_rows: Optional[int]

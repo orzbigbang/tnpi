@@ -252,7 +252,7 @@ def compute_plant_time_range_and_signal_count(
     *,
     map_encoding: Optional[str] = None,
     data_encoding: Optional[str] = None,
-) -> Tuple[Tuple[float, float], int, Dict[str, Tuple[str, SignalType]], int]:
+) -> Tuple[Tuple[float, float], int, Dict[str, Tuple[str, SignalType]], int, List[Tuple[str, float, float]]]:
     merged_mapping: Dict[str, Tuple[str, SignalType]] = {}
     skipped = 0
     for path in plant_map_paths:
@@ -284,7 +284,10 @@ def compute_plant_time_range_and_signal_count(
 
     t_min = None
     t_max = None
+    data_spans: List[Tuple[str, float, float]] = []
     for path in plant_data_paths:
+        file_min = None
+        file_max = None
         chunks = read_csv_first_n_cols_chunks(path, 1, encoding=data_encoding)
         for df in chunks:
             if df.shape[1] < 1:
@@ -299,7 +302,13 @@ def compute_plant_time_range_and_signal_count(
                 t_min = cur_min
             if t_max is None or cur_max > t_max:
                 t_max = cur_max
+            if file_min is None or cur_min < file_min:
+                file_min = cur_min
+            if file_max is None or cur_max > file_max:
+                file_max = cur_max
+        if file_min is not None and file_max is not None:
+            data_spans.append((str(path), float(file_min), float(file_max)))
     if t_min is None or t_max is None:
         raise ValueError("PlantDB CSVs have no valid time values.")
     signal_count = len({val[0] for val in merged_mapping.values()})
-    return (t_min, t_max), signal_count, merged_mapping, skipped
+    return (t_min, t_max), signal_count, merged_mapping, skipped, data_spans

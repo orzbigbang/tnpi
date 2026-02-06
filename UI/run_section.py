@@ -1,11 +1,11 @@
-﻿from typing import Callable
+from typing import Callable
 
-import pandas as pd
 import streamlit as st
 
 from core.models import RunResult
 from state import AppConfig
 from .handlers import compute_run_result
+from .run_option import render_run_option
 
 
 def render_run_section(
@@ -13,47 +13,7 @@ def render_run_section(
     render_run_results: Callable[[RunResult], None],
 ) -> None:
     odg_names = app_cfg.odg.odg_names
-    st.subheader("Time range")
-    prev_range_mode = app_cfg.state.range_mode
-    range_mode = st.radio(
-        "Time range",
-        options=["full", "range"],
-        format_func=lambda x: {"full": "Full range", "range": "Select range"}[x],
-        index=["full", "range"].index(app_cfg.state.range_mode),
-        label_visibility="collapsed",
-    )
-    app_cfg.state.range_mode = range_mode
-    if range_mode != prev_range_mode:
-        app_cfg.dump_ini()
-    range_start = ""
-    range_end = ""
-    if range_mode == "range":
-        if app_cfg.odg.odg_time_range is not None:
-            t_min, t_max = app_cfg.odg.odg_time_range
-            dt_min = pd.to_datetime(int(t_min), unit="ns")
-            dt_max = pd.to_datetime(int(t_max), unit="ns")
-            if not app_cfg.state.range_start:
-                app_cfg.state.range_start = dt_min.strftime("%Y-%m-%d-%H-%M")
-            if not app_cfg.state.range_end:
-                app_cfg.state.range_end = dt_max.strftime("%Y-%m-%d-%H-%M")
-        r1, r2 = st.columns(2)
-        with r1:
-            range_start = st.text_input(
-                "Range start (YYYY-mm-dd-hh-mm)",
-                value=app_cfg.state.range_start,
-                placeholder="e.g. 2024-01-01-00-00",
-                key="range_start_input",
-            )
-        with r2:
-            range_end = st.text_input(
-                "Range end (YYYY-mm-dd-hh-mm)",
-                value=app_cfg.state.range_end,
-                placeholder="e.g. 2024-01-02-00-00",
-                key="range_end_input",
-            )
-        app_cfg.state.range_start = range_start
-        app_cfg.state.range_end = range_end
-        st.caption("Format uses 24-hour clock; comparison uses parsed timestamps.")
+    range_mode, range_start, range_end = render_run_option(app_cfg)
 
     def start_run() -> None:
         app_cfg.state.is_running = True

@@ -1,4 +1,4 @@
-﻿from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 from loguru import logger
 import pandas as pd
@@ -43,6 +43,7 @@ def confirm_samples(
 
     app_cfg.plant.plant_map_files = plant_meta.map_files
     app_cfg.plant.plant_data_files = plant_meta.data_files
+    app_cfg.plant.plant_data_spans = plant_meta.data_spans
     app_cfg.plant.plant_map_count = plant_meta.map_count
     app_cfg.plant.plant_data_count = plant_meta.data_count
     app_cfg.plant.plant_data_rows = plant_meta.data_rows
@@ -139,6 +140,8 @@ def parse_time_range(
         end_dt = pd.to_datetime(end_txt, format="%Y-%m-%d-%H-%M", errors="coerce")
         if pd.isna(start_dt) or pd.isna(end_dt):
             raise ValueError
+        # Inputs are minute-precision; make end inclusive for the whole minute.
+        end_dt = end_dt + pd.Timedelta(minutes=1) - pd.Timedelta(nanoseconds=1)
         start_val = float(start_dt.value)
         end_val = float(end_dt.value)
     except ValueError:
@@ -173,6 +176,7 @@ def reset_plant_state(
     plant_cfg.plant_id_signal_map = {}
     plant_cfg.plant_map_files = []
     plant_cfg.plant_data_files = []
+    plant_cfg.plant_data_spans = []
     plant_cfg.plant_map_count = None
     plant_cfg.plant_data_count = None
     plant_cfg.plant_data_rows = None

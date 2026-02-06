@@ -154,6 +154,7 @@ def confirm_plant_folder(
             plant_signal_count,
             plant_id_signal_map,
             plant_skipped_mappings,
+            plant_data_spans,
         ) = compute_plant_time_range_and_signal_count(
             plant_map_files,
             plant_data_files,
@@ -171,6 +172,7 @@ def confirm_plant_folder(
     return PlantMeta(
         map_files=plant_map_files,
         data_files=plant_data_files,
+        data_spans=plant_data_spans,
         map_count=plant_map_count,
         data_count=plant_data_count,
         data_rows=plant_data_rows,

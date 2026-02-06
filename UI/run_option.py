@@ -9,6 +9,28 @@ from state import AppConfig
 
 def render_run_option(app_cfg: AppConfig) -> Tuple[str, str, str]:
     st.subheader("Run options")
+    st.markdown(
+        """
+        <style>
+        div.stButton > button {
+            min-height: 2.7rem;
+            min-width: 4.4rem;
+            font-size: 1rem;
+            font-weight: 600;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown("Select HML")
+    hml_cols = st.columns([1, 1, 1, 6], gap="small")
+    with hml_cols[0]:
+        st.button("H", key="hml_h", use_container_width=True)
+    with hml_cols[1]:
+        st.button("M", key="hml_m", use_container_width=True)
+    with hml_cols[2]:
+        st.button("L", key="hml_l", use_container_width=True)
+
     if app_cfg.state.range_mode != "range":
         app_cfg.state.range_mode = "range"
         app_cfg.dump_ini()

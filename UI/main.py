@@ -2,16 +2,15 @@ import pandas as pd
 import streamlit as st
 
 from state import get_config
-from .handlers import confirm_samples
-from .odg_inputs import render_odg_inputs
-from .plant_inputs import render_plant_inputs
-from .run_section import render_run_section
-from .sidebar import render_sidebar
-from .result import render_run_results
-from .inspector import render_compare_samples_inspector, render_confirm_samples_inspector
+from UI.handlers import confirm_samples
+from UI.odg_inputs import render_odg_inputs
+from UI.plant_inputs import render_plant_inputs
+from UI.run_section import render_run_section
+from UI.sidebar import render_sidebar
+from UI.result import render_run_results
+from UI.inspector import render_compare_samples_inspector, render_confirm_samples_inspector
 
-
-def run() -> None:
+def run():
     app_cfg = get_config(st.session_state)
     st.set_page_config(page_title="ODG-vs-PlantDB Accuracy", layout="wide")
     st.title("ODG-vs-PlantDB Accuracy")
@@ -43,3 +42,7 @@ def run() -> None:
         render_run_section(app_cfg, render_run_results)
     else:
         st.info("Confirm both ODG and PlantDB inputs to enable run options.")
+
+
+if __name__ == "__main__":
+    run()

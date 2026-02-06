@@ -404,7 +404,7 @@ def compute_odg_meta(
                     ms = pd.to_numeric(time_df[time_df.columns[2]], errors="coerce")
                     dt = dt + pd.to_timedelta(ms.fillna(0), unit="ms")
                 if dt.notna().any():
-                    t_vals = dt.view("int64").astype(float)
+                    t_vals = dt.astype("int64", copy=False).astype(float)
                     cur_min = float(np.nanmin(t_vals))
                     cur_max = float(np.nanmax(t_vals))
                     if t_min is None or cur_min < t_min:

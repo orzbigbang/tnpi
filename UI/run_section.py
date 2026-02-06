@@ -42,12 +42,14 @@ def render_run_section(
                 "Range start (YYYY-mm-dd-hh-mm)",
                 value=app_cfg.state.range_start,
                 placeholder="e.g. 2024-01-01-00-00",
+                key="range_start_input",
             )
         with r2:
             range_end = st.text_input(
                 "Range end (YYYY-mm-dd-hh-mm)",
                 value=app_cfg.state.range_end,
                 placeholder="e.g. 2024-01-02-00-00",
+                key="range_end_input",
             )
         app_cfg.state.range_start = range_start
         app_cfg.state.range_end = range_end

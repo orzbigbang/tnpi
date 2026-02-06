@@ -14,6 +14,7 @@ def render_odg_inputs(app_cfg: AppConfig) -> str:
             "ODG folder path",
             value=app_cfg.state.odg_folder,  # load last time used folder
             placeholder=r"C:\path\to\folder",
+            key="odg_folder_input",
             label_visibility="collapsed",
         )
     with folder_cols[1]:

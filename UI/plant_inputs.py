@@ -15,6 +15,7 @@ def render_plant_inputs(app_cfg: AppConfig) -> str:
             "PlantDB folder path",
             value=app_cfg.state.plant_folder,  # load last time used folder
             placeholder=r"C:\path\to\folder",
+            key="plant_folder_input",
             label_visibility="collapsed",
         )
     with folder_cols[1]:

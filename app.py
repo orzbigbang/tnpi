@@ -1,54 +1,21 @@
 import os
 import subprocess
 import sys
-import time
-import webbrowser
-
-from UI import run
-
-
-def resource_path(rel_path: str) -> str:
-    base = getattr(sys, "_MEIPASS", os.path.abspath("."))
-    return os.path.join(base, rel_path)
 
 
 def launch_streamlit() -> None:
-    app_path = resource_path("app.py")
+    app_path = os.path.abspath("UI/main.py")
     cmd = [
         sys.executable,
         "-m",
         "streamlit",
         "run",
         app_path,
-        "--server.headless=true",
         "--server.port=8501",
         "--browser.gatherUsageStats=false",
     ]
     env = os.environ.copy()
-    env["TNPI_STREAMLIT_CHILD"] = "1"
-    p = subprocess.Popen(
-        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env
-    )
-    time.sleep(0.1)
-    webbrowser.open("http://localhost:8501")
-    p.wait()
-
-
-def running_in_streamlit() -> bool:
-    if os.environ.get("TNPI_STREAMLIT_CHILD") == "1":
-        return True
-    try:
-        from streamlit.runtime.scriptrunner import get_script_run_ctx
-    except Exception:
-        return False
-    return get_script_run_ctx(True) is not None
-
+    subprocess.Popen(cmd, env=env)
 
 if __name__ == "__main__":
-    if running_in_streamlit():
-        run()
-    else:
-        launch_streamlit()
-
-
-# pyinstaller app.py --onefile --copy-metadata streamlit --collect-all streamlit
+    launch_streamlit()

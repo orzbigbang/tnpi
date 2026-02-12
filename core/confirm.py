@@ -8,11 +8,18 @@ from core.errors import ConfirmError
 from core.io_csv import detect_csv_encoding
 from core.models import ConfirmResult, OdgMeta, PlantMeta
 from core.parse import (
+    parse_time_values,
     compute_odg_meta,
     compute_plant_time_range_and_signal_count,
     load_odg_folder_from_dir,
     load_plant_folder_from_dir,
 )
+def confirm_plant_time(df: pd.DataFrame, *, time_col: str = "t_sample_time") -> pd.DataFrame:
+    out = df.copy()
+    out["t_ns"] = parse_time_values(out[time_col])
+    out["has_ms"] = out[time_col].astype(str).str.contains(r"\.\d+", regex=True, na=False)
+    return out
+
 
 
 def confirm_samples(odg_folder: str, plant_folder: str) -> ConfirmResult:
@@ -181,3 +188,5 @@ def confirm_plant_folder(
         signal_count=plant_signal_count,
         id_signal_map=plant_id_signal_map,
     )
+
+

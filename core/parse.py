@@ -18,31 +18,76 @@ DATE_TIME_COL_CANDIDATES = {
     "ms": ["milli sec", "millisec", "millisecond", "msec", "ms"],
 }
 
+def _as_int64_ns(t_vals: np.ndarray) -> np.ndarray:
+    t = np.asarray(t_vals)
+    if np.issubdtype(t.dtype, np.datetime64):
+        return t.astype("datetime64[ns]").astype("int64")
+
+    arr = np.asarray(t_vals, dtype="float64")
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return np.asarray([], dtype="int64")
+
+    med = float(np.median(np.abs(finite)))
+    if med < 1e11:
+        scale = 1e9
+    elif med < 1e15:
+        scale = 1e6
+    else:
+        scale = 1.0
+
+    return (arr * scale).round().astype("int64")
+
+
+# core/parse.py
+JST = "Asia/Tokyo"
 
 def parse_time_values(series: pd.Series) -> pd.Series:
-    # Strip simple trailing timezone offsets like +09 or +09:00 before parsing.
-    s = series.astype(str).str.strip()
-    s = s.str.replace(r"([+-]\d{2})(?::?\d{2})?$", "", regex=True)
-    # Remove non-printable characters that can break parsing.
-    s = s.str.replace(r"[^\x20-\x7E]", "", regex=True)
-    t_dt = pd.to_datetime(s, errors="coerce")
-    if t_dt.isna().any():
-        mask = t_dt.isna()
-        # Retry common no-fraction format for remaining rows.
-        t_dt.loc[mask] = pd.to_datetime(s[mask], format="%Y-%m-%d %H:%M:%S", errors="coerce")
-    if t_dt.notna().all():
-        return t_dt.view("int64").astype(float)  # ns
-    # Surface a small sample to help identify bad formats.
-    bad_mask = t_dt.isna()
-    sample_raw = series.astype(str).head(5).tolist()
-    sample_clean = s.head(5).tolist()
-    bad_raw = series.astype(str)[bad_mask].head(5).tolist()
-    bad_clean = s[bad_mask].head(5).tolist()
-    raise ValueError(
-        "Time column is neither numeric nor datetime-parsable. "
-        f"sample_raw={sample_raw} sample_clean={sample_clean} "
-        f"bad_count={int(bad_mask.sum())} bad_raw={bad_raw} bad_clean={bad_clean}"
-    )
+    s0 = series.astype(str).str.strip()
+    s0 = s0.str.replace(r"[^\x20-\x7E]", "", regex=True)
+
+    # +09 / +09:00 / +0900 -> +0900
+    s = s0
+    s = s.str.replace(r"([+-]\d{2}):?(\d{2})$", r"\1\2", regex=True)
+    s = s.str.replace(r"([+-]\d{2})$", r"\g<1>00", regex=True)
+
+    has_tz = s.str.contains(r"[+-]\d{4}$", regex=True, na=False)
+    has_frac = s.str.contains(r"\.\d+", regex=True, na=False)
+
+    # 带时区的行：空格改成 T，避免 pandas 对 " " + %z 的坑
+    s_tz = s.where(~has_tz, s.str.replace(" ", "T", n=1))
+
+    dt = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+
+    # A: 带时区 + 小数秒（强制 utc=True 让结果一定 tz-aware）
+    m = has_tz & has_frac
+    t = pd.to_datetime(s_tz[m], format="%Y-%m-%dT%H:%M:%S.%f%z", errors="coerce", utc=True)
+    dt.loc[m] = t.dt.tz_convert(JST).dt.tz_localize(None)
+
+    # B: 带时区 + 无小数秒
+    m = has_tz & ~has_frac
+    t = pd.to_datetime(s_tz[m], format="%Y-%m-%dT%H:%M:%S%z", errors="coerce", utc=True)
+    dt.loc[m] = t.dt.tz_convert(JST).dt.tz_localize(None)
+
+    # C: 无时区 + 小数秒（按日本时间解释，保持 naive）
+    m = (~has_tz) & has_frac
+    dt.loc[m] = pd.to_datetime(s[m], format="%Y-%m-%d %H:%M:%S.%f", errors="coerce")
+
+    # D: 无时区 + 无小数秒（按日本时间解释，保持 naive）
+    m = (~has_tz) & ~has_frac
+    dt.loc[m] = pd.to_datetime(s[m], format="%Y-%m-%d %H:%M:%S", errors="coerce")
+
+    if dt.isna().any():
+        bad = dt.isna()
+        raise ValueError(
+            "Time column contains unparsable values. "
+            f"bad_count={int(bad.sum())} "
+            f"bad_raw={series.astype(str)[bad].head(5).tolist()} "
+            f"bad_clean={s0[bad].head(5).tolist()}"
+        )
+
+    # 返回“日本时间语义”的 naive ns
+    return dt.view("int64").astype("float64")
 
 
 def normalize_id_series(series: pd.Series) -> pd.Series:
@@ -124,6 +169,91 @@ def parse_plant_samples_csv(
     wide = wide.sort_index()
     t_series = pd.Series(wide.index.to_numpy(dtype=float), name="timestamp")
     return t_series, wide.reset_index(drop=True)
+
+def parse_plant_samples_csv_chunked(
+    path: Union[str, os.PathLike],
+    id_to_signal: Dict[str, object],   # key: monitoring_id(str) -> signal名或(signal, type)
+    *,
+    encoding: Optional[str] = None,
+    time_range: Optional[Tuple[float, float]] = None,
+    chunksize: int = 2_000_000,
+) -> Tuple[pd.Series, pd.DataFrame]:
+    TIME_COL = "t_sample_time"
+    ID_COL   = "n_monitoring_id"
+    VAL_COL  = "n_signal1"
+
+    wanted_ids = set(map(str, id_to_signal.keys()))
+    usecols = [TIME_COL, ID_COL, VAL_COL]
+
+    if time_range is not None:
+        start, end = time_range
+        start_ns = _as_int64_ns(np.asarray([start], dtype="float64"))[0]
+        end_ns   = _as_int64_ns(np.asarray([end], dtype="float64"))[0]
+
+    # sid -> {t_ns: value}
+    series_map: Dict[str, Dict[int, float]] = {sid: {} for sid in wanted_ids}
+    all_times: set[int] = set()
+
+    for chunk in pd.read_csv(path, encoding=encoding, usecols=usecols, chunksize=chunksize):
+        # 1) 过滤 ID（先过滤再解析时间，省 CPU）
+        chunk[ID_COL] = chunk[ID_COL].astype(str)
+        chunk = chunk[chunk[ID_COL].isin(wanted_ids)]
+        if chunk.empty:
+            continue
+
+        # 2) 时间转 ns（用你现有的 _as_int64_ns）
+        t_ns = _as_int64_ns(chunk[TIME_COL].to_numpy())
+        chunk = chunk.assign(_t_ns=t_ns)
+
+        if time_range is not None:
+            m = (chunk["_t_ns"] >= start_ns) & (chunk["_t_ns"] <= end_ns)
+            chunk = chunk[m]
+            if chunk.empty:
+                continue
+
+        # 3) value 数值化
+        chunk["_v"] = pd.to_numeric(chunk[VAL_COL], errors="coerce")
+        chunk = chunk.dropna(subset=["_t_ns", ID_COL, "_v"])
+        if chunk.empty:
+            continue
+
+        # 4) (time,id) 重复：取最后一个
+        chunk = chunk.sort_values("_t_ns").drop_duplicates(subset=["_t_ns", ID_COL], keep="last")
+
+        # 5) 累积到 dict
+        for sid, sub in chunk.groupby(ID_COL, sort=False):
+            d = series_map.get(sid)
+            if d is None:
+                continue
+            tn = sub["_t_ns"].to_numpy(dtype="int64")
+            vv = sub["_v"].to_numpy(dtype="float64")
+            for ti, vi in zip(tn, vv):
+                d[int(ti)] = float(vi)
+                all_times.add(int(ti))
+
+    if not all_times:
+        return pd.Series([], dtype="float64", name="timestamp"), pd.DataFrame()
+
+    times_sorted = np.array(sorted(all_times), dtype="int64")
+    t_series = pd.Series(times_sorted.astype("float64"), name="timestamp")
+
+    # 宽表输出：列名用映射后的 signal 名
+    idx = pd.Index(times_sorted)
+    out = {}
+    for sid, d in series_map.items():
+        mapped = id_to_signal.get(sid)
+        if mapped is None:
+            continue
+        col_name = mapped[0] if isinstance(mapped, tuple) else mapped
+
+        arr = np.full(times_sorted.shape, np.nan, dtype="float64")
+        # 填充
+        for ti, vi in d.items():
+            arr[idx.get_loc(ti)] = vi
+        out[col_name] = arr
+
+    y_df = pd.DataFrame(out)
+    return t_series, y_df
 
 
 def load_odg_folder_from_dir(dir_path: str) -> List[str]:

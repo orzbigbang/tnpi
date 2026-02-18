@@ -1,5 +1,6 @@
 import os
 from typing import Dict, List, Optional, Tuple, Union
+from array import array  # ← 添加这一行
 
 import numpy as np
 import pandas as pd
@@ -86,8 +87,8 @@ def parse_time_values(series: pd.Series) -> pd.Series:
             f"bad_clean={s0[bad].head(5).tolist()}"
         )
 
-    # 返回“日本时间语义”的 naive ns
-    return dt.view("int64").astype("float64")
+    # 返回"日本时间语义"的 naive ns
+    return dt.view("int64")
 
 
 def normalize_id_series(series: pd.Series) -> pd.Series:
@@ -107,6 +108,7 @@ def parse_odg_time_series_csv(
     encoding: Optional[str] = None,
 ) -> Tuple[pd.Series, pd.DataFrame]:
     df = read_csv_path(path, encoding=encoding)
+
     cols_lower = {c.lower(): c for c in df.columns}
     date_col = next((cols_lower[c] for c in DATE_TIME_COL_CANDIDATES["date"] if c in cols_lower), None)
     time_col2 = next((cols_lower[c] for c in DATE_TIME_COL_CANDIDATES["time"] if c in cols_lower), None)
@@ -124,11 +126,17 @@ def parse_odg_time_series_csv(
     if not dt.notna().all():
         raise ValueError("ODG Date/Time columns are not datetime-parsable.")
 
-    t_vals = dt.view("int64").astype(float)  # ns
+    # 时间：float64(ns)（后续你会转 int64；这里保持不动）
+    t_vals = dt.view("int64").astype(np.float64)
+
     drop_cols = [date_col, time_col2] + ([ms_col] if ms_col else [])
     signals = df.drop(columns=drop_cols)
-    signals = signals.apply(pd.to_numeric, errors="coerce")
+
+    # 关键：直接生成 float32，避免 signals 常驻 float64
+    signals = signals.apply(pd.to_numeric, errors="coerce").astype(np.float32, copy=False)
+
     return pd.Series(t_vals, name="timestamp"), signals
+
 
 
 def _normalize_id_to_signal(
@@ -155,10 +163,12 @@ def parse_plant_samples_csv(
     id_col = df.columns[1]
     value_col = df.columns[2]
 
-    t_vals = parse_time_values(df[time_col])
+    t_vals = parse_time_values(df[time_col])            # float64(ns)
     ids = normalize_id_series(df[id_col])
     signals = ids.map(_normalize_id_to_signal(id_to_signal))
-    values = pd.to_numeric(df[value_col], errors="coerce")
+
+    # 关键：value 直接 float32
+    values = pd.to_numeric(df[value_col], errors="coerce").astype(np.float32, copy=False)
 
     tmp = pd.DataFrame({"t": t_vals, "signal": signals, "value": values})
     tmp = tmp.dropna(subset=["t", "signal", "value"])
@@ -167,12 +177,17 @@ def parse_plant_samples_csv(
 
     wide = tmp.pivot_table(index="t", columns="signal", values="value", aggfunc="mean")
     wide = wide.sort_index()
-    t_series = pd.Series(wide.index.to_numpy(dtype=float), name="timestamp")
+
+    # 关键：宽表 float32
+    wide = wide.astype(np.float32, copy=False)
+
+    t_series = pd.Series(wide.index.to_numpy(dtype=np.float64), name="timestamp")
     return t_series, wide.reset_index(drop=True)
+
 
 def parse_plant_samples_csv_chunked(
     path: Union[str, os.PathLike],
-    id_to_signal: Dict[str, object],   # key: monitoring_id(str) -> signal名或(signal, type)
+    id_to_signal: Dict[str, object],
     *,
     encoding: Optional[str] = None,
     time_range: Optional[Tuple[float, float]] = None,
@@ -190,18 +205,26 @@ def parse_plant_samples_csv_chunked(
         start_ns = _as_int64_ns(np.asarray([start], dtype="float64"))[0]
         end_ns   = _as_int64_ns(np.asarray([end], dtype="float64"))[0]
 
-    # sid -> {t_ns: value}
-    series_map: Dict[str, Dict[int, float]] = {sid: {} for sid in wanted_ids}
-    all_times: set[int] = set()
+    # sid -> (times:int64 array('q'), values:float32 array('f'))
+    t_buf: Dict[str, array] = {sid: array("q") for sid in wanted_ids}
+    v_buf: Dict[str, array] = {sid: array("f") for sid in wanted_ids}
 
-    for chunk in pd.read_csv(path, encoding=encoding, usecols=usecols, chunksize=chunksize):
-        # 1) 过滤 ID（先过滤再解析时间，省 CPU）
+    # 全体时间：用 array('q') 聚合（比 set[int] 省非常多）
+    all_t = array("q")
+
+    read_kwargs = dict(
+        encoding=encoding,
+        usecols=usecols,
+        chunksize=chunksize,
+        dtype={VAL_COL: "float32"},   # 读入阶段就 float32
+    )
+
+    for chunk in pd.read_csv(path, **read_kwargs):
         chunk[ID_COL] = chunk[ID_COL].astype(str)
         chunk = chunk[chunk[ID_COL].isin(wanted_ids)]
         if chunk.empty:
             continue
 
-        # 2) 时间转 ns（用你现有的 _as_int64_ns）
         t_ns = _as_int64_ns(chunk[TIME_COL].to_numpy())
         chunk = chunk.assign(_t_ns=t_ns)
 
@@ -211,49 +234,70 @@ def parse_plant_samples_csv_chunked(
             if chunk.empty:
                 continue
 
-        # 3) value 数值化
-        chunk["_v"] = pd.to_numeric(chunk[VAL_COL], errors="coerce")
+        chunk["_v"] = pd.to_numeric(chunk[VAL_COL], errors="coerce").astype(np.float32, copy=False)
         chunk = chunk.dropna(subset=["_t_ns", ID_COL, "_v"])
         if chunk.empty:
             continue
 
-        # 4) (time,id) 重复：取最后一个
+        # (time,id) 重复：取最后
         chunk = chunk.sort_values("_t_ns").drop_duplicates(subset=["_t_ns", ID_COL], keep="last")
 
-        # 5) 累积到 dict
+        # 追加到紧凑数组
         for sid, sub in chunk.groupby(ID_COL, sort=False):
-            d = series_map.get(sid)
-            if d is None:
-                continue
-            tn = sub["_t_ns"].to_numpy(dtype="int64")
-            vv = sub["_v"].to_numpy(dtype="float64")
-            for ti, vi in zip(tn, vv):
-                d[int(ti)] = float(vi)
-                all_times.add(int(ti))
+            tn = sub["_t_ns"].to_numpy(dtype=np.int64, copy=False)
+            vv = sub["_v"].to_numpy(dtype=np.float32, copy=False)
 
-    if not all_times:
+            # array.frombytes 不产生 Python int/float 对象
+            t_buf[sid].frombytes(tn.tobytes())
+            v_buf[sid].frombytes(vv.tobytes())
+            all_t.frombytes(tn.tobytes())
+
+    if len(all_t) == 0:
         return pd.Series([], dtype="float64", name="timestamp"), pd.DataFrame()
 
-    times_sorted = np.array(sorted(all_times), dtype="int64")
-    t_series = pd.Series(times_sorted.astype("float64"), name="timestamp")
+    # 全体时间轴（int64）
+    all_t_np = np.frombuffer(all_t, dtype=np.int64)
+    times_sorted = np.unique(all_t_np)
+    t_series = pd.Series(times_sorted.astype(np.float64), name="timestamp")
 
-    # 宽表输出：列名用映射后的 signal 名
-    idx = pd.Index(times_sorted)
-    out = {}
-    for sid, d in series_map.items():
+    out: Dict[str, np.ndarray] = {}
+    N = times_sorted.size
+
+    for sid in wanted_ids:
         mapped = id_to_signal.get(sid)
         if mapped is None:
             continue
         col_name = mapped[0] if isinstance(mapped, tuple) else mapped
 
-        arr = np.full(times_sorted.shape, np.nan, dtype="float64")
-        # 填充
-        for ti, vi in d.items():
-            arr[idx.get_loc(ti)] = vi
+        tb = t_buf[sid]
+        if len(tb) == 0:
+            continue
+        tn = np.frombuffer(tb, dtype=np.int64)
+        vv = np.frombuffer(v_buf[sid], dtype=np.float32)
+
+        # 按时间排序
+        order = np.argsort(tn, kind="mergesort")
+        tn_s = tn[order]
+        vv_s = vv[order]
+
+        # 对同一 sid 的重复时间：保留最后一个（反转 unique）
+        tn_rev = tn_s[::-1]
+        vv_rev = vv_s[::-1]
+        _, idx = np.unique(tn_rev, return_index=True)
+        keep_rev = np.sort(idx)
+        tn_u = tn_rev[keep_rev][::-1]
+        vv_u = vv_rev[keep_rev][::-1]
+
+        # 写入宽表列（float32）
+        arr = np.full((N,), np.nan, dtype=np.float32)
+        pos = np.searchsorted(times_sorted, tn_u)
+        # tn_u 一定来自 times_sorted 的集合；这里不做额外校验以省 CPU
+        arr[pos] = vv_u
         out[col_name] = arr
 
-    y_df = pd.DataFrame(out)
+    y_df = pd.DataFrame(out).astype(np.float32, copy=False)
     return t_series, y_df
+
 
 
 def load_odg_folder_from_dir(dir_path: str) -> List[str]:
@@ -420,7 +464,7 @@ def compute_plant_time_range_and_signal_count(
             if df.shape[1] < 1:
                 continue
             t_vals = parse_time_values(df.iloc[:, 0])
-            t_vals = pd.to_numeric(t_vals, errors="coerce").to_numpy(dtype=float)
+            t_vals = pd.to_numeric(t_vals, errors="coerce").to_numpy(dtype="int64")
             if t_vals.size == 0:
                 continue
             cur_min = float(np.nanmin(t_vals))

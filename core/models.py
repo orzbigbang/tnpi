@@ -1,6 +1,7 @@
 ﻿from dataclasses import dataclass, field
 import configparser
 import os
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, Literal
 
 import pandas as pd
@@ -11,6 +12,8 @@ from enum_types import SignalType
 @dataclass
 class RunResult:
     ok: bool
+    overlap_start: Optional[datetime] = None
+    overlap_end: Optional[datetime] = None
     summary: Optional[float] = None
     matching_score: Optional[float] = None
     rmse: Optional[float] = None
@@ -21,20 +24,31 @@ class RunResult:
     detail: Optional["pd.DataFrame"] = None
     compute_inspector: Optional[Dict[str, float]] = None
 
-    def dump_result(self) -> Tuple[str, bytes]:
-        if self.detail is None:
-            df = pd.DataFrame(
-                columns=["signal", "matching_score", "correlation", "rmse", "offset_ms"]
-            )
-        else:
-            df = self.detail.copy()
-        if "offset_ms" not in df.columns:
-            df["offset_ms"] = self.offset_ms
+def dump_result(self) -> Tuple[str, bytes]:
+    if self.detail is None:
+        df = pd.DataFrame(
+            columns=["signal", "matching_score", "correlation", "rmse", "offset_ms"]
+        )
+    else:
+        df = self.detail.copy()
 
-        df = df.reindex(columns=["signal", "matching_score", "correlation", "rmse", "offset_ms"])
-        out = df.rename(columns={"rmse": "RMSE", "offset_ms": "Offset"})
-        buf = out.to_csv(index=False, encoding="utf-8-sig")
-        return "run_result.csv", buf.encode("utf-8-sig")
+    if "offset_ms" not in df.columns:
+        df["offset_ms"] = self.offset_ms
+
+    df = df.reindex(columns=["signal", "matching_score", "correlation", "rmse", "offset_ms"])
+    out = df.rename(columns={"rmse": "RMSE", "offset_ms": "Offset"})
+    buf = out.to_csv(index=False, encoding="utf-8-sig")
+
+    if self.overlap_start and self.overlap_end:
+        file_name = (
+            f"{self.overlap_start.strftime('%Y%m%d_%H%M')}-"
+            f"{self.overlap_end.strftime('%Y%m%d_%H%M')}.csv"
+        )
+    else:
+        file_name = "run_result.csv"
+
+    return file_name, buf.encode("utf-8-sig")
+
 
 
 @dataclass

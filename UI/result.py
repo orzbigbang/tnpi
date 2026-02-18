@@ -6,7 +6,17 @@ from .inspector import render_compare_samples_inspector
 
 
 def render_run_results(result: RunResult) -> None:
-    st.subheader("Overview")
+    # 标题：重叠时间区间
+    if result.overlap_start and result.overlap_end:
+        title = (
+            f"{result.overlap_start.strftime('%Y/%m/%d %H:%M')}-"
+            f"{result.overlap_end.strftime('%Y/%m/%d %H:%M')}"
+        )
+    else:
+        title = "Overview"
+
+    st.subheader(title)
+
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         score = result.matching_score if result.matching_score is not None else result.summary
@@ -42,3 +52,4 @@ def render_run_results(result: RunResult) -> None:
         st.error(f"Prepare download failed: {ex}")
 
     render_compare_samples_inspector(result.compute_inspector)
+

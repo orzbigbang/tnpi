@@ -15,7 +15,7 @@ def launch_streamlit() -> None:
         "--browser.gatherUsageStats=false",
     ]
     env = os.environ.copy()
-    subprocess.Popen(cmd, env=env)
+    subprocess.Popen(cmd, env=env).wait()
 
 if __name__ == "__main__":
     launch_streamlit()

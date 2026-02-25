@@ -1,35 +1,43 @@
-# === metrics.py（趋势一致性版：corr/corr_d 门槛 + 乘法融合得分）===
+# === 完整替换块：metrics.py（自适应权重 + corr只统计非平坦信号 + 输出nonflat汇总）===
 
 import os
-import time
-from typing import Dict, Optional, Tuple, Union, List
+from typing import Dict, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
+import time
+
+from numpy.fft import rfft, irfft
+
+
+def next_fast_len(n):
+    """返回下一个 2 的幂次方，用于 FFT 优化"""
+    if n <= 1:
+        return 1
+    return 1 << (n - 1).bit_length()
+
 
 from enum_types import SignalType
 from core.models import CompareConfig
-from core.parse import (
-    parse_odg_time_series_csv,
-    parse_plant_samples_csv_chunked,
-)
+from core.parse import parse_odg_time_series_csv, parse_plant_samples_csv, parse_plant_samples_csv_chunked
+
 
 # ---------------- dtype knobs ----------------
-F = np.float32          # 信号值/中间数组：float32
-TF = np.float64         # np.interp 坐标：float64 更稳
-TINT = np.int64         # 时间：int64 ns
+F = np.float32
+TF = np.float64
+TINT = np.int64
 
 EPS = 1e-12
 OFFSET_SEARCH_MS = 120000
 OFFSET_GRID_MS = 50
 OFFSET_MIN_POINTS = 30
 
+# 融合权重（非平坦信号）
+W_TREND = 0.7
+W_ERROR = 0.3
 
-# 自己实现 next_fast_len（FFT 优化）
-def next_fast_len(n: int) -> int:
-    if n <= 1:
-        return 1
-    return 1 << (n - 1).bit_length()
+# 常数/近常数信号判定阈值（绝对std阈值）
+FLAT_STD_TH = 1e-6
 
 
 def linear_interp_truth(
@@ -67,11 +75,12 @@ def _as_int64_ns(t_vals: np.ndarray) -> np.ndarray:
 
     med = float(np.median(np.abs(finite)))
     if med < 1e11:
-        scale = 1e9      # seconds -> ns
+        scale = 1e9
     elif med < 1e15:
-        scale = 1e6      # ms -> ns
+        scale = 1e6
     else:
-        scale = 1.0      # already ns
+        scale = 1.0
+
     return (arr * scale).round().astype(TINT)
 
 
@@ -221,12 +230,12 @@ def estimate_offset_ms(
     if window_ns < min_len_ns:
         window_ns = min_len_ns
 
-    lags_ms: List[float] = []
+    lags_ms: list[float] = []
     skipped_windows = 0
     cur = start
 
     while cur < end:
-        MAX_STEPS = 2_000_000
+        MAX_STEPS = 100_000
         w_end = min(cur + window_ns, end)
 
         span = int(w_end - cur)
@@ -269,18 +278,6 @@ def estimate_offset_ms(
     return float(np.median(np.asarray(lags_ms, dtype=np.float32)))
 
 
-def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:
-    a = np.asarray(a, dtype=np.float64)
-    b = np.asarray(b, dtype=np.float64)
-    if a.size < 2 or b.size < 2:
-        return float("nan")
-    sa = float(np.nanstd(a))
-    sb = float(np.nanstd(b))
-    if not np.isfinite(sa) or not np.isfinite(sb) or sa < 1e-12 or sb < 1e-12:
-        return float("nan")
-    return float(np.corrcoef(a, b)[0, 1])
-
-
 def compute_compare_metrics(
     id_to_signal: Dict[str, Union[str, Tuple[str, SignalType]]],
     plant_data_path: Union[str, os.PathLike],
@@ -295,13 +292,14 @@ def compute_compare_metrics(
     t0 = time.perf_counter()
     profile: Dict[str, float] = {}
 
-    # ---------- 1) 读 ODG ----------
+    # ---------- 1) 先读 ODG ----------
     t1 = time.perf_counter()
     t_h, x_h = parse_odg_time_series_csv(odg_path, encoding=odg_encoding)
     profile["parse_odg_ms"] = (time.perf_counter() - t1) * 1000.0
 
-    if time_range is None and len(t_h) >= 2:
-        time_range = (float(t_h.iloc[0]), float(t_h.iloc[-1]))
+    if time_range is None:
+        if len(t_h) >= 2:
+            time_range = (float(t_h.iloc[0]), float(t_h.iloc[-1]))
 
     # ---------- 2) 读 PlantDB ----------
     t2 = time.perf_counter()
@@ -318,7 +316,15 @@ def compute_compare_metrics(
     profile["parse_plant_ms"] = (time.perf_counter() - t2) * 1000.0
 
     if len(t_l) < 2 or y_l.empty or len(t_h) < 2 or x_h.empty:
-        metrics = {"matching_score": float("nan"), "rmse": float("nan"), "correlation": float("nan"), "offset_ms": float("nan")}
+        metrics = {
+            "matching_score": float("nan"),
+            "rmse": float("nan"),
+            "correlation": float("nan"),               # 非平坦corr均值
+            "correlation_all": float("nan"),           # 全信号corr均值（可选）
+            "matching_score_nonflat": float("nan"),    # 非平坦matching均值（可选）
+            "flat_ratio": float("nan"),                # 平坦信号占比（可选）
+            "offset_ms": float("nan"),
+        }
         profile["total_ms"] = (time.perf_counter() - t0) * 1000.0
         return metrics, pd.DataFrame(), profile
 
@@ -338,6 +344,7 @@ def compute_compare_metrics(
     # ---------- 4) ns(int64) ----------
     t_plant_ns = _as_int64_ns(t_plant)
     t_odg_ns = _as_int64_ns(t_odg)
+
     t_plant_f = t_plant_ns.astype(np.float64)
     t_odg_f = t_odg_ns.astype(np.float64)
 
@@ -346,40 +353,17 @@ def compute_compare_metrics(
     if not common_cols:
         raise ValueError("No overlapping signal columns between plant and odg CSV.")
 
-    # ---------- 6) denom（用于相对误差） ----------
+    # ---------- 6) denom ----------
     denom: Dict[str, Optional[float]] = {}
-
-    ranges = []
-
     for c in common_cols:
         xs = x_h[c].to_numpy(dtype=np.float32)
-
-        max_val = float(np.nanmax(xs))
-        min_val = float(np.nanmin(xs))
-        range_val = max_val - min_val
-
-        ranges.append((c, range_val))
-
         if cfg.accuracy_denominator == "range":
-            d = range_val
+            d = float(np.nanmax(xs) - np.nanmin(xs))
         elif cfg.accuracy_denominator == "std":
             d = float(np.nanstd(xs))
         else:
             d = None
-
         denom[c] = d
-
-    # ---- 只看 range 最大 / 最小的 2 个 ----
-    if ranges:
-        ranges.sort(key=lambda x: x[1])
-
-        print("\n=== range 最小的2个 ===")
-        for c, r in ranges[:2]:
-            print(f"{c}: {r:.6f}")
-
-        print("\n=== range 最大的2个 ===")
-        for c, r in ranges[-2:]:
-            print(f"{c}: {r:.6f}")
 
     # ---------- 7) 估 offset ----------
     t4 = time.perf_counter()
@@ -391,8 +375,10 @@ def compute_compare_metrics(
     y_mean = y_l[cols_for_offset].astype("float32").mean(axis=1, skipna=True).to_numpy(dtype=np.float32)
 
     offset_ms = estimate_offset_ms(
-        t_odg_ns, x_mean,
-        t_plant_ns, y_mean,
+        t_odg_ns,
+        x_mean,
+        t_plant_ns,
+        y_mean,
         grid_ms=200,
         search_ms=OFFSET_SEARCH_MS,
         window_ms=5_000,
@@ -407,15 +393,19 @@ def compute_compare_metrics(
     t5 = time.perf_counter()
     rows = []
 
-    # 汇总
-    final_scores: List[float] = []
-    rmse_values: List[float] = []
-    corr_values: List[float] = []
+    # 全体（用于matching_score / rmse）
+    score_values_all = []
+    rmse_values_all = []
 
-    # 趋势判定参数（可按需调）
-    CORR_GATE = 0.80          # 趋势最低线
-    USE_DIFF_CORR = True      # 是否引入差分相关（斜率/趋势）
-    TREND_MIX = 0.5           # corr 与 corr_d 的混合权重（0~1），0.5=均分
+    # corr两套：all / nonflat
+    corr_values_all = []
+    corr_values_nonflat = []
+
+    # 非平坦matching（可选输出）
+    score_values_nonflat = []
+
+    n_flat = 0
+    n_used = 0
 
     for c in common_cols:
         xs = x_h[c].to_numpy(dtype=np.float32)
@@ -433,93 +423,118 @@ def compute_compare_metrics(
         if th.size < 2:
             continue
 
-        x_hat = linear_interp_truth(th, xh, t_plant_aligned_f, cfg.out_of_range_policy)  # float32
+        x_hat = linear_interp_truth(th, xh, t_plant_aligned_f, cfg.out_of_range_policy)
 
         ok = np.isfinite(ys) & np.isfinite(x_hat)
         n_ok = int(ok.sum())
-        if n_ok < 2:
+        if n_ok == 0:
             continue
 
-        y_ok = ys[ok].astype(np.float64)
-        x_ok = x_hat[ok].astype(np.float64)
+        n_used += 1
 
-        diff = (y_ok - x_ok)
-        rmse = float(np.sqrt(np.mean(diff * diff)))
+        diff = (ys - x_hat).astype(np.float32, copy=False)
+        abs_diff = np.abs(diff).astype(np.float32, copy=False)
 
-        corr = _safe_corr(y_ok, x_ok)
+        rmse = float(np.sqrt(np.nanmean((diff[ok] * diff[ok]).astype(np.float32))))
+        corr = (
+            float(np.corrcoef(ys[ok].astype(np.float64), x_hat[ok].astype(np.float64))[0, 1])
+            if n_ok > 1
+            else float("nan")
+        )
 
-        # 差分相关：更强调“趋势/斜率一致”
-        corr_d = float("nan")
-        if USE_DIFF_CORR and n_ok >= 3:
-            dy = np.diff(y_ok)
-            dx = np.diff(x_ok)
-            corr_d = _safe_corr(dy, dx)
-
-        # 趋势得分：把负相关视为 0
-        corr_pos = max(0.0, corr) if np.isfinite(corr) else float("nan")
-        corr_d_pos = max(0.0, corr_d) if np.isfinite(corr_d) else float("nan")
-
-        if np.isfinite(corr_pos) and np.isfinite(corr_d_pos):
-            trend_score = float(TREND_MIX * corr_pos + (1.0 - TREND_MIX) * corr_d_pos)
-        elif np.isfinite(corr_pos):
-            trend_score = float(corr_pos)
-        elif np.isfinite(corr_d_pos):
-            trend_score = float(corr_d_pos)
-        else:
-            trend_score = float("nan")
-
-        # 误差得分：用你原来的“相对误差 r”，再聚合成 0~1
-        abs_diff = np.abs(y_ok - x_ok).astype(np.float32)
-
+        # 误差分（0~1）
         if cfg.accuracy_denominator == "abs_truth":
-            s = np.abs(x_ok).astype(np.float32) + np.float32(EPS)
+            s = np.abs(x_hat).astype(np.float32, copy=False) + np.float32(EPS)
             r = abs_diff / s
         else:
-            d = denom.get(c)
-            d = float(d) if (d is not None and np.isfinite(d) and d > EPS) else 1.0
+            d = denom[c]
+            d = float(d) if (d is not None and d > EPS) else 1.0
             r = abs_diff / (np.float32(d) + np.float32(EPS))
 
-        r_clip = np.clip(r.astype(np.float32), 0.0, 1.0)
-        nrmse_like = float(np.mean(r_clip))          # 0好1差
-        err_score = float(1.0 - nrmse_like)          # 0差1好
+        point_acc = 1.0 - np.clip(r, 0.0, 1.0)
+        sig_acc = (
+            float(np.nanmean(point_acc[ok])) if cfg.aggregate_policy == "mean"
+            else float(np.nanmin(point_acc[ok]))
+        )
+        error_score = float(sig_acc)
 
-        # ✅ 最终：趋势门槛 + 乘法融合（趋势否决）
-        if (not np.isfinite(trend_score)) or (trend_score < CORR_GATE):
-            final_score = 0.0
+        # 平坦判定
+        std_truth = float(np.nanstd(x_hat[ok].astype(np.float64)))
+        std_plant = float(np.nanstd(ys[ok].astype(np.float64)))
+        flat = (std_truth < FLAT_STD_TH) or (std_plant < FLAT_STD_TH)
+        if flat:
+            n_flat += 1
+
+        # 趋势分/融合分
+        if flat:
+            trend_score = float("nan")
+            sig_score = error_score
         else:
-            final_score = float(trend_score * err_score)
+            if np.isfinite(corr):
+                trend_score = float(np.clip((corr + 1.0) / 2.0, 0.0, 1.0))
+                sig_score = W_TREND * trend_score + W_ERROR * error_score
+            else:
+                trend_score = float("nan")
+                sig_score = error_score
 
+        # detail输出
         rows.append(
             {
                 "signal": c,
                 "n_points_used": n_ok,
-                "matching_score": final_score,     # 现在是趋势一致性分
-                "trend_score": trend_score,        # 趋势项（0~1）
-                "err_score": err_score,            # 误差项（0~1）
-                "correlation": corr,
-                "corr_diff": corr_d,
+                "matching_score": float(sig_score),
+                "trend_score": float(trend_score),
+                "error_score": float(error_score),
                 "rmse": rmse,
-                "mean_abs_error": float(np.mean(abs_diff)),
+                "correlation": corr,
+                "mean_abs_error": float(np.nanmean(abs_diff[ok].astype(np.float32))),
                 "offset_ms": float(offset_ms),
+                "is_flat": bool(flat),
+                "std_truth": float(std_truth),
+                "std_plant": float(std_plant),
             }
         )
 
-        final_scores.append(final_score)
-        rmse_values.append(rmse)
+        # 汇总
+        score_values_all.append(float(sig_score))
+        rmse_values_all.append(float(rmse))
+
         if np.isfinite(corr):
-            corr_values.append(corr)
+            corr_values_all.append(float(corr))
+            if not flat:
+                corr_values_nonflat.append(float(corr))
+
+        if not flat:
+            score_values_nonflat.append(float(sig_score))
 
     detail = pd.DataFrame(rows)
     if not detail.empty:
         detail = detail.sort_values("matching_score", ascending=True)
 
-    metrics = {
-        "matching_score": float(np.nanmean(final_scores)) if final_scores else float("nan"),
-        "rmse": float(np.nanmean(rmse_values)) if rmse_values else float("nan"),
-        "correlation": float(np.nanmean(corr_values)) if corr_values else float("nan"),
-        "offset_ms": float(offset_ms),
-    }
+    matching_score = float(np.nanmean(score_values_all)) if score_values_all else float("nan")
+    rmse_avg = float(np.nanmean(rmse_values_all)) if rmse_values_all else float("nan")
+
+    # ✅ 核心：UI建议展示这个（非平坦信号的corr均值）
+    corr_avg_nonflat = float(np.nanmean(corr_values_nonflat)) if corr_values_nonflat else float("nan")
+
+    # 可选：保留一个“全体corr均值”用于调试
+    corr_avg_all = float(np.nanmean(corr_values_all)) if corr_values_all else float("nan")
+
+    # 可选：非平坦matching均值（更直观）
+    matching_score_nonflat = float(np.nanmean(score_values_nonflat)) if score_values_nonflat else float("nan")
+
+    flat_ratio = (float(n_flat) / float(n_used)) if n_used > 0 else float("nan")
 
     profile["per_signal_ms"] = (time.perf_counter() - t5) * 1000.0
     profile["total_ms"] = (time.perf_counter() - t0) * 1000.0
+
+    metrics = {
+        "matching_score": matching_score,
+        "rmse": rmse_avg,
+        "correlation": corr_avg_nonflat,          # ✅ 建议UI显示这个
+        "correlation_all": corr_avg_all,          # 可选
+        "matching_score_nonflat": matching_score_nonflat,  # 可选
+        "flat_ratio": flat_ratio,                 # 可选：解释“为什么corr低”
+        "offset_ms": float(offset_ms),
+    }
     return metrics, detail, profile

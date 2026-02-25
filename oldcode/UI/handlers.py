@@ -136,6 +136,9 @@ def validate_sampling_overlap(app_cfg: AppConfig) -> Optional[str]:
         return "ODG and PlantDB time ranges do not overlap."
     return None
 
+    print(overlap_start)
+    print(overlap_end)
+
 
 def parse_time_range(
     range_mode: str,

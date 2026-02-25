@@ -80,10 +80,11 @@ def validate_sampling_overlap(app_cfg: AppConfig) -> Optional[str]:
     plant_start, plant_end = app_cfg.plant.plant_time_range
     overlap_start = max(odg_start, plant_start)
     overlap_end = min(odg_end, plant_end)
+    print(overlap_start, overlap_end)
+
     if overlap_start > overlap_end:
         return "ODG and PlantDB time ranges do not overlap."
     return None
-
 
 def compute_run_result(
     app_cfg: AppConfig,

@@ -24,30 +24,30 @@ class RunResult:
     detail: Optional["pd.DataFrame"] = None
     compute_inspector: Optional[Dict[str, float]] = None
 
-def dump_result(self) -> Tuple[str, bytes]:
-    if self.detail is None:
-        df = pd.DataFrame(
-            columns=["signal", "matching_score", "correlation", "rmse", "offset_ms"]
-        )
-    else:
-        df = self.detail.copy()
+    def dump_result(self) -> Tuple[str, bytes]:
+        if self.detail is None:
+            df = pd.DataFrame(
+                columns=["signal", "matching_score", "correlation", "rmse", "offset_ms"]
+            )
+        else:
+            df = self.detail.copy()
 
-    if "offset_ms" not in df.columns:
-        df["offset_ms"] = self.offset_ms
+        if "offset_ms" not in df.columns:
+            df["offset_ms"] = self.offset_ms
 
-    df = df.reindex(columns=["signal", "matching_score", "correlation", "rmse", "offset_ms"])
-    out = df.rename(columns={"rmse": "RMSE", "offset_ms": "Offset"})
-    buf = out.to_csv(index=False, encoding="utf-8-sig")
+        df = df.reindex(columns=["signal", "matching_score", "correlation", "rmse", "offset_ms"])
+        out = df.rename(columns={"rmse": "RMSE", "offset_ms": "Offset"})
+        buf = out.to_csv(index=False, encoding="utf-8-sig")
 
-    if self.overlap_start and self.overlap_end:
-        file_name = (
-            f"{self.overlap_start.strftime('%Y%m%d_%H%M')}-"
-            f"{self.overlap_end.strftime('%Y%m%d_%H%M')}.csv"
-        )
-    else:
-        file_name = "run_result.csv"
+        if self.overlap_start and self.overlap_end:
+            file_name = (
+                f"{self.overlap_start.strftime('%Y%m%d_%H%M')}-"
+                f"{self.overlap_end.strftime('%Y%m%d_%H%M')}.csv"
+            )
+        else:
+            file_name = "run_result.csv"
 
-    return file_name, buf.encode("utf-8-sig")
+        return file_name, buf.encode("utf-8-sig")
 
 
 

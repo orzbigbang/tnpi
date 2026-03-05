@@ -1,12 +1,14 @@
 from dataclasses import dataclass, field
 import configparser
 import os
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, Literal
 
 import pandas as pd
 
 from enum_types import SignalType
+from settings import RESULT_OUTPUT_FOLDER
 
 
 @dataclass
@@ -24,6 +26,29 @@ class RunResult:
     detail: Optional["pd.DataFrame"] = None
     compute_inspector: Optional[Dict[str, float]] = None
 
+    def _infer_signal_kind_tag(self, df: "pd.DataFrame") -> str:
+        if "signal" not in df.columns or df.empty:
+            return "H"
+
+        has_h = False
+        has_m = False
+        has_l = False
+
+        for raw in df["signal"].dropna().astype(str):
+            s = raw.strip().lower()
+            if not s:
+                continue
+
+            if re.search(r"\bhigh\b|(?:^|[_\-\s])h(?:$|[_\-\s])", s):
+                has_h = True
+            if re.search(r"\bmiddle\b|\bmid\b|(?:^|[_\-\s])m(?:$|[_\-\s])", s):
+                has_m = True
+            if re.search(r"\blow\b|(?:^|[_\-\s])l(?:$|[_\-\s])", s):
+                has_l = True
+
+        tag = "".join([c for c, ok in (("H", has_h), ("M", has_m), ("L", has_l)) if ok])
+        return tag or "H"
+
     def dump_result(self) -> Tuple[str, bytes]:
         if self.detail is None:
             df = pd.DataFrame(
@@ -40,16 +65,23 @@ class RunResult:
         )
         out = df.rename(columns={"rmse": "RMSE", "offset_ms": "Offset"})
         buf = out.to_csv(index=False, encoding="utf-8-sig")
+        payload = buf.encode("utf-8-sig")
+        signal_kind_tag = self._infer_signal_kind_tag(df)
 
         if self.overlap_start and self.overlap_end:
             file_name = (
-                f"{self.overlap_start.strftime('%Y%m%d_%H%M')}-"
-                f"{self.overlap_end.strftime('%Y%m%d_%H%M')}.csv"
+                f"{self.overlap_start.strftime('%Y%m%d%H%M')}-"
+                f"{self.overlap_end.strftime('%Y%m%d%H%M')}_{signal_kind_tag}.csv"
             )
         else:
-            file_name = "run_result.csv"
+            file_name = f"run_result_{signal_kind_tag}.csv"
 
-        return file_name, buf.encode("utf-8-sig")
+        os.makedirs(RESULT_OUTPUT_FOLDER, exist_ok=True)
+        output_path = os.path.join(RESULT_OUTPUT_FOLDER, file_name)
+        with open(output_path, "wb") as handle:
+            handle.write(payload)
+
+        return file_name, payload
 
 
 
